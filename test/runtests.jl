@@ -214,9 +214,10 @@ const test_exename = popfirst!(test_exeflags.exec)
 function addworker(X; kwargs...)
     exename = if do_sanitize
         sanitizer = CUDA.compute_sanitizer()
-        @info "Running under $(readchomp(`$sanitizer --version`))"
+        @info "Running under $(readchomp(`$sanitizer --version`))" maxlog=1
         # NVIDIA bug 3263616: compute-sanitizer crashes when generating host backtraces
-        `$sanitizer --tool $sanitize_tool --launch-timeout=0 --show-backtrace=no --target-processes=all --report-api-errors=no $test_exename`
+        # NOTE: --language=fortran to print 1-based thread indices
+        `$sanitizer --tool $sanitize_tool --launch-timeout=0 --show-backtrace=no --target-processes=all --report-api-errors=no --language=fortran $test_exename`
     else
         test_exename
     end
