@@ -50,7 +50,8 @@ mutable struct TaskLocalState
         math_mode = something(default_math_mode[],
                               Base.JLOptions().fast_math==1 ? FAST_MATH : DEFAULT_MATH)
         math_precision = something(default_math_precision[], :TensorFloat32)
-        new(dev, ctx, Base.fill(nothing, ndevices()), math_mode, math_precision)
+        new(dev, ctx, Union{Nothing,CuStream}[nothing for _ in 1:ndevices()],
+            math_mode, math_precision)
     end
 end
 
@@ -68,8 +69,13 @@ end
 function task_local_state!(args...)
     tls = task_local_storage()
     if haskey(tls, :CUDA)
-        validate_task_local_state(@inbounds(tls[:CUDA]))
+        validate_task_local_state(@inbounds(tls[:CUDA])::TaskLocalState)
     else
+        # verify that CUDA.jl is functional. this doesn't belong here, but since we can't
+        # error during `__init__`, we do it here instead as this is the first function
+        # that's likely executed when using CUDA.jl
+        @assert functional(true)
+
         tls[:CUDA] = TaskLocalState(args...)
     end::TaskLocalState
 end
@@ -159,7 +165,7 @@ end
 @inline function context!(f::Function, ctx::CuContext; skip_destroyed::Bool=false)
     # @inline so that the kwarg method is inlined too and we can const-prop skip_destroyed
     if isvalid(ctx)
-        old_ctx = context!(ctx)
+        old_ctx = context!(ctx)::Union{CuContext,Nothing}
         try
             f()
         finally
@@ -187,7 +193,7 @@ end
 
 const __device_contexts = LazyInitialized{Vector{Union{Nothing,CuContext}}}()
 device_contexts() = get!(__device_contexts) do
-    [nothing for _ in 1:ndevices()]
+    Union{Nothing,CuContext}[nothing for _ in 1:ndevices()]
 end
 function device_context(i::Int)
     contexts = device_contexts()
@@ -211,9 +217,34 @@ function context(dev::CuDevice)
         return ctx
     end
 
+    # check if the device isn't too old
     if capability(dev) < v"3.5"
-        @warn("""Your $(name(dev)) GPU does not meet the minimal required compute capability ($(capability(dev)) < 3.5).
-                 Some functionality might be unavailable.""",
+        @error("""Your $(name(dev)) GPU (compute capability $(capability(dev).major).$(capability(dev).minor)) is not supported by CUDA.jl.
+                  Please use a device with at least capability 3.5.""",
+               maxlog=1, _id=devidx)
+    elseif runtime_version() >= v"12" && capability(dev) <= v"3.7"
+        @error("""Your $(name(dev)) GPU (compute capability $(capability(dev).major).$(capability(dev).minor)) is not supported on CUDA 12+.
+                  Please use CUDA 11.8 or earlier (by calling `CUDA.set_runtime_version!`), or switch to a different device.""",
+               maxlog=1, _id=devidx)
+    elseif runtime_version() >= v"11" && capability(dev) <= v"3.7"
+        # XXX: the 10.2 release notes mention that even sm_50 is deprecated,
+        #      but that isn't repeated in more recent release notes...
+        @warn("""Your $(name(dev)) GPU (compute capability $(capability(dev).major).$(capability(dev).minor)) is deprecated on CUDA 11+.
+                  Some functionality may be broken; It's recommended to switch to a different device.""",
+              maxlog=1, _id=devidx)
+    end
+    # ... or too new
+    if !in(capability(dev), cuda_compat().cap)
+        @warn("""Your $(name(dev)) GPU (compute capability $(capability(dev).major).$(capability(dev).minor)) is not fully supported by CUDA $(runtime_version()).
+                 Some functionality may be broken. Ensure you are using the latest version of CUDA.jl in combination with an up-to-date NVIDIA driver.
+                 If that does not help, please file an issue to add support for the latest CUDA toolkit.""",
+              maxlog=1, _id=devidx)
+    end
+
+    # warn about some known bugs
+    if runtime_version() < v"11.5" && capability(dev) < v"7"
+        @warn("""There are known codegen bugs on CUDA 11.4 and earlier for older GPUs like your $(name(dev)).
+                 Please use CUDA 11.5 or later, or switch to a different device.""",
               maxlog=1, _id=devidx)
     end
 
@@ -272,7 +303,8 @@ function device!(f::Function, dev::CuDevice)
 end
 
 # NVIDIA bug #3240770
-can_reset_device() = !(release() == v"11.2" && any(dev->stream_ordered(dev), devices()))
+can_reset_device() = !(Base.thisminor(driver_version()) == v"11.2" &&
+                       any(dev->stream_ordered(dev), devices()))
 
 """
     device_reset!(dev::CuDevice=device())
@@ -354,10 +386,11 @@ end
     stream = CuStream()
 
     # register the name of this task
-    t = current_task()
-    tptr = pointer_from_objref(current_task())
-    tptrstr = string(convert(UInt, tptr), base=16, pad=Sys.WORD_SIZE>>2)
-    NVTX.nvtxNameCuStreamA(stream, "Task(0x$tptrstr)")
+    # XXX: do this when the user has imported NVTX.jl (using weak dependencies?)
+    #t = current_task()
+    #tptr = pointer_from_objref(current_task())
+    #tptrstr = string(convert(UInt, tptr), base=16, pad=Sys.WORD_SIZE>>2)
+    #NVTX.nvtxNameCuStreamA(stream, "Task(0x$tptrstr)")
 
     stream
 end
@@ -411,7 +444,7 @@ an array or a dictionary, use additional locks.
 """
 struct PerDevice{T}
     lock::ReentrantLock
-    values::LazyInitialized{Vector{Union{Nothing,Tuple{CuContext,T}}}}
+    values::LazyInitialized{Vector{Union{Nothing,Tuple{CuContext,T}}},Nothing}
 end
 
 function PerDevice{T}() where {T}
@@ -419,8 +452,8 @@ function PerDevice{T}() where {T}
     PerDevice{T}(ReentrantLock(), values)
 end
 
-get_values(x::PerDevice) = get!(x.values) do
-    Base.fill(nothing, ndevices())
+get_values(x::PerDevice{T}) where {T} = get!(x.values) do
+    Union{Nothing,Tuple{CuContext,T}}[nothing for _ in 1:ndevices()]
 end
 
 function Base.get(x::PerDevice, dev::CuDevice, val)
@@ -437,20 +470,20 @@ function Base.get(x::PerDevice, dev::CuDevice, val)
     end
 end
 
-function Base.get!(constructor::F, x::PerDevice, dev::CuDevice) where {F}
+function Base.get!(constructor::F, x::PerDevice{T}, dev::CuDevice) where {F, T}
     y = get_values(x)
     id = deviceid(dev)+1
     ctx = device_context(id)    # may be nothing
     @inbounds begin
         # test-lock-test
-        if y[id] === nothing || y[id][1] !== ctx
+        if y[id] === nothing || (y[id]::Tuple)[1] !== ctx
             Base.@lock x.lock begin
-                if y[id] === nothing || y[id][1] !== ctx
+                if y[id] === nothing || (y[id]::Tuple)[1] !== ctx
                     y[id] = (context(), constructor())
                 end
             end
         end
-        y[id][2]
+        (y[id]::Tuple)[2]
     end
 end
 

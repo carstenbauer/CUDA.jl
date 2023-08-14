@@ -11,36 +11,35 @@ testf(f, xs...; kwargs...) = TestSuite.compare(f, CuArray, xs...; kwargs...)
 
 using Random
 
-# detect compute-sanitizer, to disable incompatible tests (e.g. using CUPTI),
-# and to skip tests that are known to generate innocuous API errors
+# detect compute-sanitizer, to disable incompatible tests (e.g. using CUPTI)
 const sanitize = any(contains("NV_SANITIZER"), keys(ENV))
-macro not_if_sanitize(ex)
-    sanitize || return esc(ex)
-    quote
-        @test_skip $ex
+
+# in addition, CUPTI is not available on older GPUs with recent CUDA toolkits
+function can_use_cupti()
+    sanitize && return false
+
+    # NVIDIA bug #3964667: CUPTI in CUDA 11.7+ broken for sm_35 devices
+    if CUDA.runtime_version() >= v"11.7" && capability(device()) <= v"3.7"
+        return false
     end
+
+    # Tegra requires running as root and and modifying the device tree
+    if CUDA.is_tegra()
+        return false
+    end
+
+    return true
 end
 
 # precompile the runtime library
 CUDA.precompile_runtime()
 
-# enable debug timers
-using TimerOutputs
-if isdefined(CUDA, :to)
-    reset_timer!(CUDA.to)
-end
-
 
 ## entry point
 
-function runtests(f, name, time_source=:cuda, snoop=nothing)
+function runtests(f, name, time_source=:cuda)
     old_print_setting = Test.TESTSET_PRINT_ENABLE[]
     Test.TESTSET_PRINT_ENABLE[] = false
-
-    if snoop !== nothing
-        io = open(snoop, "w")
-        ccall(:jl_dump_compiles, Nothing, (Ptr{Nothing},), io.handle)
-    end
 
     try
         # generate a temporary module to execute the tests in
@@ -112,11 +111,6 @@ function runtests(f, name, time_source=:cuda, snoop=nothing)
         CUDA.can_reset_device() && device_reset!()
         res
     finally
-        if snoop !== nothing
-            ccall(:jl_dump_compiles, Nothing, (Ptr{Nothing},), C_NULL)
-            close(io)
-        end
-
         Test.TESTSET_PRINT_ENABLE[] = old_print_setting
     end
 end
@@ -232,10 +226,7 @@ end
 function julia_exec(args::Cmd, env...)
     # FIXME: this doesn't work when the compute mode is set to exclusive
     cmd = Base.julia_cmd()
-    if Base.JLOptions().project != C_NULL
-        cmd = `$cmd --project=$(unsafe_string(Base.JLOptions().project))`
-    end
-    cmd = `$cmd --color=no $args`
+    cmd = `$cmd --project=$(Base.active_project()) --color=no $args`
 
     out = Pipe()
     err = Pipe()
@@ -244,17 +235,6 @@ function julia_exec(args::Cmd, env...)
     close(err.in)
     wait(proc)
     proc, read(out, String), read(err, String)
-end
-
-# tests that are conditionall broken
-macro test_broken_if(cond, ex...)
-    quote
-        if $(esc(cond))
-            @test_broken $(map(esc, ex)...)
-        else
-            @test $(map(esc, ex)...)
-        end
-    end
 end
 
 # some tests are mysteriously broken with certain hardware/software.

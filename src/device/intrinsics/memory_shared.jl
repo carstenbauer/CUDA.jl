@@ -10,13 +10,15 @@ pointing to a statically-allocated piece of shared memory. The type should be st
 inferable and the dimensions should be constant, or an error will be thrown and the
 generator function will be called dynamically.
 """
-@inline function CuStaticSharedArray(::Type{T}, dims) where {T}
+@inline function CuStaticSharedArray(::Type{T}, dims::Tuple) where {T}
+    N = length(dims)
     len = prod(dims)
     # NOTE: this relies on const-prop to forward the literal length to the generator.
     #       maybe we should include the size in the type, like StaticArrays does?
     ptr = emit_shmem(T, Val(len))
-    CuDeviceArray(dims, ptr)
+    CuDeviceArray{T,N,AS.Shared}(ptr, dims)
 end
+CuStaticSharedArray(::Type{T}, len::Integer) where {T} = CuStaticSharedArray(T, (len,))
 
 macro cuStaticSharedMem(T, dims)
     Base.depwarn("@cuStaticSharedMem is deprecated, please use the CuStaticSharedArray function", :CuStaticSharedArray)
@@ -38,11 +40,12 @@ Optionally, an offset parameter indicating how many bytes to add to the base sha
 pointer can be specified. This is useful when dealing with a heterogeneous buffer of dynamic
 shared memory; in the case of a homogeneous multi-part buffer it is preferred to use `view`.
 """
-@inline function CuDynamicSharedArray(::Type{T}, dims, offset) where {T}
+@inline function CuDynamicSharedArray(::Type{T}, dims::Tuple, offset) where {T}
+    N = length(dims)
     @boundscheck begin
         len = prod(dims)
         sz = len*sizeof(T)
-        if Base.isbitsunion(T)
+        if !isbitstype(T)
             sz += len
         end
         if offset+sz > dynamic_smem_size()
@@ -50,8 +53,10 @@ shared memory; in the case of a homogeneous multi-part buffer it is preferred to
         end
     end
     ptr = emit_shmem(T) + offset
-    CuDeviceArray(dims, ptr)
+    CuDeviceArray{T,N,AS.Shared}(ptr, dims)
 end
+Base.@propagate_inbounds CuDynamicSharedArray(::Type{T}, len::Integer, offset) where {T} =
+    CuDynamicSharedArray(T, (len,), offset)
 # XXX: default argument-generated methods do not propagate inboundsness
 Base.@propagate_inbounds CuDynamicSharedArray(::Type{T}, dims) where {T} =
     CuDynamicSharedArray(T, dims, 0)
@@ -68,17 +73,17 @@ dynamic_smem_size() =
 
 # get a pointer to shared memory, with known (static) or zero length (dynamic shared memory)
 @generated function emit_shmem(::Type{T}, ::Val{len}=Val(0)) where {T,len}
-    Context() do ctx
-        T_int8 = LLVM.Int8Type(ctx)
-        T_ptr = convert(LLVMType, LLVMPtr{T,AS.Shared}; ctx)
+    @dispose ctx=Context() begin
+        T_int8 = LLVM.Int8Type()
+        T_ptr = convert(LLVMType, LLVMPtr{T,AS.Shared})
 
         # create a function
         llvm_f, _ = create_function(T_ptr)
 
         # determine the array size
-        # TODO: assert that T isbitstype || isbitsunion (or it won't have a layout)
+        # TODO: assert that allocatedinline(T) (or it won't have a layout)
         sz = len*sizeof(T)
-        if Base.isbitsunion(T)
+        if !isbitstype(T)
             sz += len
         end
 
@@ -106,7 +111,7 @@ dynamic_smem_size() =
         align = 32
         if isbitstype(T)
             align = max(align, Base.datatype_alignment(T))
-        else # if isbitsunion(T)
+        else # isbitsunion etc
             for typ in Base.uniontypes(T)
                 if typ.layout != C_NULL
                     align = max(align, Base.datatype_alignment(typ))
@@ -116,11 +121,11 @@ dynamic_smem_size() =
         alignment!(gv, align)
 
         # generate IR
-        Builder(ctx) do builder
-            entry = BasicBlock(llvm_f, "entry"; ctx)
+        @dispose builder=IRBuilder() begin
+            entry = BasicBlock(llvm_f, "entry")
             position!(builder, entry)
 
-            ptr = gep!(builder, gv, [ConstantInt(0; ctx), ConstantInt(0; ctx)])
+            ptr = gep!(builder, gv_typ, gv, [ConstantInt(0), ConstantInt(0)])
 
             untyped_ptr = bitcast!(builder, ptr, T_ptr)
 

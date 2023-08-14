@@ -2,9 +2,13 @@ module CUSPARSE
 
 using ..APIUtils
 
+using ..CUDA_Runtime
+
 using ..CUDA
 using ..CUDA: CUstream, cuComplex, cuDoubleComplex, libraryPropertyType, cudaDataType
-using ..CUDA: libcusparse, unsafe_free!, @retry_reclaim, initialize_context, i32, @allowscalar
+using ..CUDA: unsafe_free!, retry_reclaim, initialize_context, i32, @allowscalar
+
+using ..CUDA.GPUArrays
 
 using CEnum: @cenum
 
@@ -19,23 +23,23 @@ const SparseChar = Char
 
 
 # core library
-include("libcusparse_common.jl")
-include("error.jl")
 include("libcusparse.jl")
 include("libcusparse_deprecated.jl")
 
+include("error.jl")
 include("array.jl")
 include("util.jl")
 include("types.jl")
+include("linalg.jl")
 
 # low-level wrappers
 include("helpers.jl")
 include("management.jl")
-include("level1.jl")
 include("level2.jl")
 include("level3.jl")
 include("extra.jl")
 include("preconditioners.jl")
+include("reorderings.jl")
 include("conversions.jl")
 include("generic.jl")
 
@@ -45,6 +49,7 @@ include("interfaces.jl")
 # native functionality
 include("device.jl")
 include("broadcast.jl")
+include("reduce.jl")
 
 # cache for created, but unused handles
 const idle_handles = HandleCache{CuContext,cusparseHandle_t}()
@@ -82,7 +87,7 @@ function handle()
 
     # update stream
     @noinline function update_stream(cuda, state)
-        cusparseSetStream_v2(state.handle, cuda.stream)
+        cusparseSetStream(state.handle, cuda.stream)
         (; state.handle, cuda.stream)
     end
     if state.stream != cuda.stream

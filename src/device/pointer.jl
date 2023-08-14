@@ -37,8 +37,29 @@ for T in LDGTypes
                                           ::Val{align}) where align
         offset = i-one(i) # in elements
         ptr = base_ptr + offset*sizeof($T)
-        @typed_ccall($intr, llvmcall, $T, (LLVMPtr{$T,AS.Global}, Int32), ptr, align)
+        @typed_ccall($intr, llvmcall, $T, (LLVMPtr{$T,AS.Global}, Int32), ptr, Val(align))
     end
+end
+
+for (N, T) in ((4, Float32), (2, Float64), (4, Int8), (4, Int16), (4, Int32), (2, Int64))
+    class = if T <: Integer
+        :i
+    elseif T <: AbstractFloat
+        :f
+    end
+    # TODO: p class
+    width = sizeof(T)*8 # in bits
+    typ = Symbol(class, width)
+
+    intr = "llvm.nvvm.ldg.global.$class.v$N$typ.p1v$N$typ"
+    @eval @inline function pointerref_ldg(base_ptr::LLVMPtr{NTuple{$N, Base.VecElement{$T}},AS.Global}, i::Integer,
+                                          ::Val{align}) where align
+        offset = i-one(i) # in elements
+        ptr = base_ptr + offset*$N*sizeof($T)
+        @typed_ccall($intr, llvmcall, $NTuple{$N, Base.VecElement{$T}}, (LLVMPtr{NTuple{$N, Base.VecElement{$T}},AS.Global}, Int32), ptr, Val(align))
+    end
+    @eval unsafe_cached_load(p::LLVMPtr{NTuple{$N, Base.VecElement{$T}},AS.Global}, i::Integer=1, align::Val=Val(1)) =
+        pointerref_ldg(p, i, align)
 end
 
 # interface

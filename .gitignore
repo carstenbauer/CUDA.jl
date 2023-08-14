@@ -5,3 +5,5 @@
 .vscode
 lcov.info
 build/
+/lib/**/Manifest.toml
+/lib/**/LocalPreferences.toml

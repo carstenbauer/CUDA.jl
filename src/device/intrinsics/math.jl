@@ -40,6 +40,9 @@ end
     ccall("extern __nv_sincosf", llvmcall, Cvoid, (Cfloat, Ptr{Cfloat}, Ptr{Cfloat}), x, s, c)
     return (s[], c[])
 end
+# Base has sincos_fast fall back to the native implementation which is presumed faster,
+# but that is not the case compared to CUDA's intrinsics
+@device_override FastMath.sincos_fast(x::Union{Float64,Float32}) = (FastMath.sin_fast(x), FastMath.cos_fast(x))
 
 @device_override function Base.sincospi(x::Float64)
     s = Ref{Cdouble}()
@@ -170,7 +173,9 @@ end
     assume(within(UInt64(0), UInt64(64)),
            ccall("extern __nv_popcll", llvmcall, Int32, (UInt64,), x))
 
-@device_function function byte_perm(x::Union{Int32, UInt32}, y::Union{Int32, UInt32}, z::Union{Int32, UInt32})
+@device_function function byte_perm(x::Union{Int32, UInt32, Int16, UInt16, Int8, UInt8},
+                                    y::Union{Int32, UInt32, Int16, UInt16, Int8, UInt8},
+                                    z::Union{Int32, UInt32, Int16, UInt16, Int8, UInt8})
     # Reinterpret the input values instead of letting `ccall` convert them with a range check
     x %= UInt32
     y %= UInt32
@@ -347,3 +352,6 @@ end
 
 @device_function scalbn(x::Float64, y::Int32) = ccall("extern __nv_scalbn", llvmcall, Cdouble, (Cdouble, Int32), x, y)
 @device_function scalbn(x::Float32, y::Int32) = ccall("extern __nv_scalbnf", llvmcall, Cfloat, (Cfloat, Int32), x, y)
+
+@device_function norm3df(x::Float32, y::Float32, z::Float32) = ccall("extern __nv_norm3df", llvmcall, Cfloat, (Cfloat, Cfloat, Cfloat), x, y, z)
+@device_function rnorm3df(x::Float32, y::Float32, z::Float32) = ccall("extern __nv_rnorm3df", llvmcall, Cfloat, (Cfloat, Cfloat, Cfloat), x, y, z)

@@ -388,8 +388,8 @@ end
 
 ## copy operations
 
-for (fn, srcPtrTy, dstPtrTy) in (("cuMemcpyDtoHAsync_v2", CuPtr, Ptr),
-                                 ("cuMemcpyHtoDAsync_v2", Ptr,   CuPtr),
+for (fn, srcPtrTy, dstPtrTy) in (("cuMemcpyDtoHAsync_v2", :CuPtr, :Ptr),
+                                 ("cuMemcpyHtoDAsync_v2", :Ptr,   :CuPtr),
                                  )
     @eval function Base.unsafe_copyto!(dst::$dstPtrTy{T}, src::$srcPtrTy{T}, N::Integer;
                                        stream::CuStream=stream(),
@@ -541,7 +541,7 @@ function unsafe_copy3d!(dst::Union{Ptr{T},CuPtr{T},CuArrayPtr{T}}, dstTyp::Type{
     # JuliaGPU/CUDA.jl#863: cuMemcpy3DAsync calculates wrong offset
     #                       when using the stream-ordered memory allocator
     # NOTE: we apply the workaround unconditionally, since we want to keep this call cheap.
-    if v"11.2" <= CUDA.release() <= v"11.3" #&& CUDA.pools[device()].stream_ordered
+    if v"11.2" <= CUDA.driver_version() <= v"11.3" #&& CUDA.pools[device()].stream_ordered
         srcOffset = (srcPos.x-1)*sizeof(T) + srcPitch*((srcPos.y-1) + srcHeight*(srcPos.z-1))
         dstOffset = (dstPos.x-1)*sizeof(T) + dstPitch*((dstPos.y-1) + dstHeight*(dstPos.z-1))
     else
@@ -663,7 +663,7 @@ function __pin(ptr::Ptr{Nothing}, sz::Int)
     ctx = context()
     key = (ctx,ptr)
 
-    @lock __pin_lock begin
+    Base.@lock __pin_lock begin
         pin_count = if haskey(__pin_count, key)
             __pin_count[key] += 1
         else
@@ -687,7 +687,7 @@ end
 function __unpin(ptr::Ptr{Nothing}, ctx::CuContext)
     key = (ctx,ptr)
 
-    @spinlock __pin_lock begin
+    Base.@lock __pin_lock begin
         @assert haskey(__pin_count, key) "Cannot unpin unmanaged pointer $ptr."
         pin_count = __pin_count[key] -= 1
         @assert pin_count >= 0 "Double unpin for $ptr"

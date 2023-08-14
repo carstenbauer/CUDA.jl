@@ -1,16 +1,16 @@
 # sparse linear algebra functions that perform operations between sparse and (usually tall)
 # dense matrices
 
-export mm!, mm2!, sm2!, sm2
+export mm!, sm2!, sm2
 
 """
-    mm!(transa::SparseChar, transb::SparseChar, alpha::BlasFloat, A::CuSparseMatrix, B::CuMatrix, beta::BlasFloat, C::CuMatrix, index::SparseChar)
+    mm!(transa::SparseChar, transb::SparseChar, alpha::Number, A::CuSparseMatrix, B::CuMatrix, beta::Number, C::CuMatrix, index::SparseChar)
 
 Performs `C = alpha * op(A) * op(B) + beta * C`, where `op` can be nothing (`transa = N`),
 tranpose (`transa = T`) or conjugate transpose (`transa = C`).
-`A` is a sparse matrix defined in BSR storage format. `B` and `C` are dense matrices.
+`B` and `C` are dense matrices.
 """
-mm!(transa::SparseChar, transb::SparseChar, alpha::BlasFloat, A::CuSparseMatrix, B::CuMatrix, beta::BlasFloat, C::CuMatrix, index::SparseChar)
+mm!(transa::SparseChar, transb::SparseChar, alpha::Number, A::CuSparseMatrix, B::CuMatrix, beta::Number, C::CuMatrix, index::SparseChar)
 
 # bsrmm
 for (fname,elty) in ((:cusparseSbsrmm, :Float32),
@@ -26,6 +26,11 @@ for (fname,elty) in ((:cusparseSbsrmm, :Float32),
                      beta::Number,
                      C::StridedCuMatrix{$elty},
                      index::SparseChar)
+
+            # Support transa = 'C' and `transb = 'C' for real matrices
+            transa = $elty <: Real && transa == 'C' ? 'T' : transa
+            transb = $elty <: Real && transb == 'C' ? 'T' : transb
+
             desc = CuMatrixDescriptor('G', 'L', 'N', index)
             m,k = size(A)
             mb = cld(m, A.blockDim)
@@ -46,82 +51,6 @@ for (fname,elty) in ((:cusparseSbsrmm, :Float32),
                    transa, transb, mb, n, kb, A.nnzb,
                    alpha, desc, nonzeros(A),A.rowPtr, A.colVal,
                    A.blockDim, B, ldb, beta, C, ldc)
-            C
-        end
-    end
-end
-
-for (fname,elty) in ((:cusparseScsrmm2, :Float32),
-                     (:cusparseDcsrmm2, :Float64),
-                     (:cusparseCcsrmm2, :ComplexF32),
-                     (:cusparseZcsrmm2, :ComplexF64))
-    @eval begin
-        function mm2!(transa::SparseChar,
-                      transb::SparseChar,
-                      alpha::Number,
-                      A::CuSparseMatrixCSR{$elty},
-                      B::StridedCuMatrix{$elty},
-                      beta::Number,
-                      C::StridedCuMatrix{$elty},
-                      index::SparseChar)
-            if transb == 'C'
-                throw(ArgumentError("B^H is not supported"))
-            elseif transb == 'T' && transa != 'N'
-                throw(ArgumentError("When using B^T, A can be neither transposed nor adjointed"))
-            end
-            desc = CuMatrixDescriptor('G', 'L', 'N', index)
-            m,k = size(A)
-            n = size(C)[2]
-            if transa == 'N' && transb == 'N'
-                chkmmdims(B,C,k,n,m,n)
-            elseif transa == 'N' && transb != 'N'
-                chkmmdims(B,C,n,k,m,n)
-            elseif transa != 'N' && transb == 'N'
-                chkmmdims(B,C,m,n,k,n)
-            elseif transa != 'N' && transb != 'N'
-                chkmmdims(B,C,n,m,k,n)
-            end
-            ldb = max(1,stride(B,2))
-            ldc = max(1,stride(C,2))
-            $fname(handle(),
-                   transa, transb, m, n, k, nnz(A), alpha, desc,
-                   nonzeros(A), A.rowPtr, A.colVal, B, ldb, beta, C, ldc)
-            C
-        end
-        function mm2!(transa::SparseChar,
-                      transb::SparseChar,
-                      alpha::Number,
-                      A::CuSparseMatrixCSC{$elty},
-                      B::StridedCuMatrix{$elty},
-                      beta::Number,
-                      C::StridedCuMatrix{$elty},
-                      index::SparseChar)
-            if transb == 'C'
-                throw(ArgumentError("B^H is not supported"))
-            elseif transb == 'T' && transa != 'N'
-                throw(ArgumentError("When using B^T, A can be neither transposed nor adjointed"))
-            end
-            ctransa = 'N'
-            if transa == 'N'
-                ctransa = 'T'
-            end
-            desc = CuMatrixDescriptor('G', 'L', 'N', index)
-            k,m = size(A)
-            n = size(C)[2]
-            if ctransa == 'N' && transb == 'N'
-                chkmmdims(B,C,k,n,m,n)
-            elseif ctransa == 'N' && transb != 'N'
-                chkmmdims(B,C,n,k,m,n)
-            elseif ctransa != 'N' && transb == 'N'
-                chkmmdims(B,C,m,n,k,n)
-            elseif ctransa != 'N' && transb != 'N'
-                chkmmdims(B,C,n,m,k,n)
-            end
-            ldb = max(1,stride(B,2))
-            ldc = max(1,stride(C,2))
-            $fname(handle(),
-                   ctransa, transb, m, n, k, nnz(A), alpha, desc,
-                   nonzeros(A), A.colPtr, rowvals(A), B, ldb, beta, C, ldc)
             C
         end
     end
@@ -151,6 +80,11 @@ for (bname,aname,sname,elty) in ((:cusparseSbsrsm2_bufferSize, :cusparseSbsrsm2_
                       A::CuSparseMatrixBSR{$elty},
                       X::StridedCuMatrix{$elty},
                       index::SparseChar)
+
+            # Support transa = 'C' and transxy = 'C' for real matrices
+            transa = $elty <: Real && transa == 'C' ? 'T' : transa
+            transxy = $elty <: Real && transxy == 'C' ? 'T' : transxy
+
             desc = CuMatrixDescriptor('G', uplo, diag, index)
             m,n = size(A)
             if m != n
@@ -211,6 +145,11 @@ for (bname,aname,sname,elty) in ((:cusparseScsrsm2_bufferSizeExt, :cusparseScsrs
                       A::CuSparseMatrixCSR{$elty},
                       X::StridedCuMatrix{$elty},
                       index::SparseChar)
+
+            # Support transa = 'C' and transxy = 'C' for real matrices
+            transa = $elty <: Real && transa == 'C' ? 'T' : transa
+            transxy = $elty <: Real && transxy == 'C' ? 'T' : transxy
+
             desc = CuMatrixDescriptor('G', uplo, diag, index)
             m,n = size(A)
             if m != n
@@ -271,10 +210,17 @@ for (bname,aname,sname,elty) in ((:cusparseScsrsm2_bufferSizeExt, :cusparseScsrs
                       A::CuSparseMatrixCSC{$elty},
                       X::StridedCuMatrix{$elty},
                       index::SparseChar)
+
+            # Support transa = 'C' and transxy = 'C' for real matrices
+            transa = $elty <: Real && transa == 'C' ? 'T' : transa
+            transxy = $elty <: Real && transxy == 'C' ? 'T' : transxy
+
             ctransa = 'N'
             cuplo = 'U'
             if transa == 'N'
                 ctransa = 'T'
+            elseif transa == 'C' && $elty <: Complex
+                throw(ArgumentError("Backward and forward sweeps with the adjoint of a complex CSC matrix is not supported. Use a CSR matrix instead."))
             end
             if uplo == 'U'
                 cuplo = 'L'
@@ -324,35 +270,16 @@ for (bname,aname,sname,elty) in ((:cusparseScsrsm2_bufferSizeExt, :cusparseScsrs
         end
     end
 end
-
-for elty in (:Float32, :Float64, :ComplexF32, :ComplexF64)
-    @eval begin
-        function sm2(transa::SparseChar,
-                     transxy::SparseChar,
-                     uplo::SparseChar,
-                     diag::SparseChar,
-                     alpha::Number,
-                     A::CuSparseMatrix{$elty},
-                     X::StridedCuMatrix{$elty},
-                     index::SparseChar)
-            sm2!(transa,transxy,uplo,diag,alpha,A,copy(X),index)
-        end
-        function sm2(transa::SparseChar,
-                     transxy::SparseChar,
-                     uplo::SparseChar,
-                     diag::SparseChar,
-                     A::CuSparseMatrix{$elty},
-                     X::StridedCuMatrix{$elty},
-                     index::SparseChar)
-            sm2!(transa,transxy,uplo,diag,one($elty),A,copy(X),index)
-        end
-        function sm2(transa::SparseChar,
-                     transxy::SparseChar,
-                     uplo::SparseChar,
-                     A::CuSparseMatrix{$elty},
-                     X::StridedCuMatrix{$elty},
-                     index::SparseChar)
-            sm2!(transa,transxy,uplo,'N',one($elty),A,copy(X),index)
-        end
-    end
+function sm2(transa::SparseChar, transxy::SparseChar, uplo::SparseChar, diag::SparseChar,
+             alpha::Number, A::CuSparseMatrix{T}, X::StridedCuMatrix{T},
+             index::SparseChar) where T
+    sm2!(transa,transxy,uplo,diag,alpha,A,copy(X),index)
+end
+function sm2(transa::SparseChar, transxy::SparseChar, uplo::SparseChar, diag::SparseChar,
+              A::CuSparseMatrix{T}, X::StridedCuMatrix{T}, index::SparseChar) where T
+    sm2!(transa,transxy,uplo,diag,one(T),A,copy(X),index)
+end
+function sm2(transa::SparseChar, transxy::SparseChar, uplo::SparseChar,
+             A::CuSparseMatrix{T}, X::StridedCuMatrix{T}, index::SparseChar) where T
+    sm2!(transa,transxy,uplo,'N',one(T),A,copy(X),index)
 end

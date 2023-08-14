@@ -3,8 +3,11 @@ module CUBLAS
 using ..APIUtils
 
 using ..CUDA
-using ..CUDA: CUstream, cuComplex, cuDoubleComplex, libraryPropertyType, cudaDataType
-using ..CUDA: libcublas, unsafe_free!, @retry_reclaim, isdebug, @sync, initialize_context
+using ..CUDA: CUstream, cuComplex, cuDoubleComplex, libraryPropertyType, cudaDataType, i32
+using ..CUDA: unsafe_free!, retry_reclaim, isdebug, @sync, initialize_context
+
+using ..CUDA: CUDA_Runtime
+using ..CUDA_Runtime
 
 using GPUArrays
 
@@ -19,12 +22,11 @@ using CEnum: @cenum
 
 
 # core library
-include("libcublas_common.jl")
-include("error.jl")
 include("libcublas.jl")
 include("libcublas_deprecated.jl")
 
 # low-level wrappers
+include("error.jl")
 include("util.jl")
 include("wrappers.jl")
 
@@ -62,7 +64,7 @@ function math_mode!(handle, mode)
         end
     end
 
-    cublasSetMathMode(handle, flags)
+    cublasSetMathMode(handle, cublasMath_t(flags))
 
     return
 end
@@ -150,7 +152,7 @@ function xt_handle()
         finalizer(current_task()) do task
             push!(idle_xt_handles, cuda.context, new_handle) do
                 # TODO: which context do we need to destroy this on?
-                cublasXtDestroy(handle)
+                cublasXtDestroy(new_handle)
             end
         end
 
@@ -233,7 +235,15 @@ function _log_message(blob)
     return
 end
 
-function __runtime_init__()
+function __init__()
+    precompiling = ccall(:jl_generating_output, Cint, ()) != 0
+    precompiling && return
+
+    if !CUDA_Runtime.is_available()
+        #@error "cuBLAS is not available"
+        return
+    end
+
     # register a log callback
     log_cond[] = Base.AsyncCondition() do async_cond
         blob = ""

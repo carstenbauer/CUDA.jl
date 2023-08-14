@@ -18,26 +18,21 @@ using BFloat16s: BFloat16
 
 using ExprTools: splitdef, combinedef
 
-# TODO: set lib versions in bindeps or so
+using CUDA_Driver_jll
 
-# XXX: to be replaced by a JLL
-include("../deps/Deps.jl")
-using .Deps
-
-# only use TimerOutputs on non latency-critical CI, in part because
-# @timeit_debug isn't truely zero-cost (KristofferC/TimerOutputs.jl#120)
-if getenv("CI", false) && !getenv("BENCHMARKS", false)
-    using TimerOutputs
-    const to = TimerOutput()
-
-    macro timeit_ci(args...)
-        TimerOutputs.timer_expr(CUDA, false, :($CUDA.to), args...)
-    end
+import CUDA_Runtime_jll
+if haskey(CUDA_Runtime_jll.preferences, "version") &&
+   CUDA_Runtime_jll.preferences["version"] == "local"
+    using CUDA_Runtime_Discovery
+    const CUDA_Runtime = CUDA_Runtime_Discovery
 else
-    macro timeit_ci(args...)
-        esc(args[end])
-    end
+    using CUDA_Runtime_jll
+    const CUDA_Runtime = CUDA_Runtime_jll
 end
+
+import Preferences
+
+using Libdl
 
 
 ## source code includes
@@ -50,6 +45,7 @@ include("../lib/cudadrv/CUDAdrv.jl")
 
 # essential stuff
 include("initialization.jl")
+include("compatibility.jl")
 include("debug.jl")
 
 # device functionality (needs to be loaded first, because of generated functions)
@@ -68,11 +64,10 @@ include("array.jl")
 
 # compiler libraries
 include("../lib/cupti/CUPTI.jl")
-include("../lib/nvtx/NVTX.jl")
-export CUPTI, NVTX
+export CUPTI
 
 # compiler implementation
-include("compiler/gpucompiler.jl")
+include("compiler/compilation.jl")
 include("compiler/execution.jl")
 include("compiler/exceptions.jl")
 include("compiler/reflection.jl")
@@ -88,9 +83,9 @@ include("broadcast.jl")
 include("mapreduce.jl")
 include("accumulate.jl")
 include("reverse.jl")
-include("linalg.jl")
 include("iterator.jl")
 include("sorting.jl")
+include("profile.jl")
 
 # array libraries
 include("../lib/complex.jl")
@@ -100,9 +95,10 @@ include("../lib/cusparse/CUSPARSE.jl")
 include("../lib/cusolver/CUSOLVER.jl")
 include("../lib/cufft/CUFFT.jl")
 include("../lib/curand/CURAND.jl")
-include("../lib/cudnn/CUDNN.jl")
-include("../lib/cutensor/CUTENSOR.jl")
-export CUBLAS, CUSPARSE, CUSOLVER, CUFFT, CURAND, CUDNN, CUTENSOR
+
+export CUBLAS, CUSPARSE, CUSOLVER, CUFFT, CURAND
+const has_cusolvermg = CUSOLVER.has_cusolvermg
+export has_cusolvermg
 
 # random depends on CURAND
 include("random.jl")
@@ -112,7 +108,11 @@ include("../lib/nvml/NVML.jl")
 const has_nvml = NVML.has_nvml
 export NVML, has_nvml
 
-include("deprecated.jl")
+# KernelAbstractions
+include("CUDAKernels.jl")
+import .CUDAKernels: CUDABackend
+export CUDABackend
+
 include("precompile.jl")
 
 end

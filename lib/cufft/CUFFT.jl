@@ -2,9 +2,11 @@ module CUFFT
 
 using ..APIUtils
 
+using ..CUDA_Runtime
+
 using ..CUDA
 using ..CUDA: CUstream, cuComplex, cuDoubleComplex, libraryPropertyType
-using ..CUDA: libcufft, unsafe_free!, @retry_reclaim, initialize_context
+using ..CUDA: unsafe_free!, retry_reclaim, initialize_context
 
 using CEnum: @cenum
 
@@ -12,11 +14,10 @@ using Reexport: @reexport
 
 
 # core library
-include("libcufft_common.jl")
-include("error.jl")
 include("libcufft.jl")
 
 # low-level wrappers
+include("error.jl")
 include("util.jl")
 include("wrappers.jl")
 

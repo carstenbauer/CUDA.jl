@@ -20,7 +20,7 @@ interpolation that happens when indexing into this texture. The source memory of
 texture is specified by the `M` parameter, either linear memory or a texture array.
 
 Device-side texture objects cannot be created directly, but should be created host-side
-using [`CuTexture{T,N,P}`](@ref) and passed to the kernal as an argument.
+using [`CuTexture{T,N,P}`](@ref) and passed to the kernel as an argument.
 
 !!! warning
     Experimental API. Subject to change without deprecation.
@@ -56,11 +56,11 @@ end
 Base.Tuple(x::Vec4) = tuple(x.a, x.b, x.c, x.d)
 
 for (dispatch_rettyp, julia_rettyp, llvm_rettyp) in
-        ((Signed,        Vec4{UInt32},  :v4u32),
-         (Unsigned,      Vec4{Int32},   :v4s32),
-         (AbstractFloat, Vec4{Float32}, :v4f32))
+        ((:Signed,        :(Vec4{UInt32}),  :v4u32),
+         (:Unsigned,      :(Vec4{Int32}),   :v4s32),
+         (:AbstractFloat, :(Vec4{Float32}), :v4f32))
 
-    eltyp = Union{dispatch_rettyp, NTuple{<:Any,dispatch_rettyp}}
+    eltyp = :(Union{$dispatch_rettyp, NTuple{<:Any,$dispatch_rettyp}})
 
     # tex1D only supports array memory
     @eval tex(texObject::CuDeviceTexture{<:$eltyp,1,ArrayMemory}, x::Number) =

@@ -22,6 +22,57 @@ ArrayStorage(buf::B, state::Int) where {B} =
 
 ## array type
 
+function hasfieldcount(@nospecialize(dt))
+    try
+        fieldcount(dt)
+    catch
+        return false
+    end
+    return true
+end
+
+function explain_eltype(@nospecialize(T), depth=0; maxdepth=10)
+    depth > maxdepth && return ""
+
+    if T isa Union
+      msg = "  "^depth * "$T is a union that's not allocated inline\n"
+      for U in Base.uniontypes(T)
+        if !Base.allocatedinline(U)
+          msg *= explain_eltype(U, depth+1)
+        end
+      end
+    elseif Base.ismutabletype(T)
+      msg = "  "^depth * "$T is a mutable type\n"
+    elseif hasfieldcount(T)
+      msg = "  "^depth * "$T is a struct that's not allocated inline\n"
+      for U in fieldtypes(T)
+          if !Base.allocatedinline(U)
+              msg *= explain_nonisbits(U, depth+1)
+          end
+      end
+    else
+      msg = "  "^depth * "$T is not allocated inline\n"
+    end
+    return msg
+end
+
+# CuArray only supports element types that are allocated inline (`Base.allocatedinline`).
+# These come in three forms:
+# 1. plain bitstypes (`Int`, `(Float32, Float64)`, plain immutable structs, etc).
+#    these are simply stored contiguously in the buffer.
+# 2. structs of unions (`struct Foo; x::Union{Int, Float32}; end`)
+#    these are stored with a selector at the end (handled by Julia).
+# 3. bitstype unions (`Union{Int, Float32}`, etc)
+#    these are stored contiguously and require a selector array (handled by us)
+function check_eltype(T)
+  if !Base.allocatedinline(T)
+    explanation = explain_eltype(T)
+    error("""
+      CuArray only supports element types that are allocated inline.
+      $explanation""")
+  end
+end
+
 mutable struct CuArray{T,N,B} <: AbstractGPUArray{T,N}
   storage::Union{Nothing,ArrayStorage{B}}
 
@@ -31,7 +82,7 @@ mutable struct CuArray{T,N,B} <: AbstractGPUArray{T,N}
   dims::Dims{N}
 
   function CuArray{T,N,B}(::UndefInitializer, dims::Dims{N}) where {T,N,B}
-    Base.allocatedinline(T) || error("CuArray only supports element types that are stored inline")
+    check_eltype(T)
     maxsize = prod(dims) * sizeof(T)
     bufsize = if Base.isbitsunion(T)
       # type tag array past the data
@@ -47,7 +98,7 @@ mutable struct CuArray{T,N,B} <: AbstractGPUArray{T,N}
 
   function CuArray{T,N}(storage::ArrayStorage{B}, dims::Dims{N};
                         maxsize::Int=prod(dims) * sizeof(T), offset::Int=0) where {T,N,B}
-    Base.allocatedinline(T) || error("CuArray only supports element types that are stored inline")
+    check_eltype(T)
     return new{T,N,B}(storage, maxsize, offset, dims)
   end
 end
@@ -69,14 +120,14 @@ function unsafe_free!(xs::CuArray, stream::CuStream=stream())
   # this call should only have an effect once, because both the user and the GC can call it
   if xs.storage === nothing
     return
-  elseif xs.storage.refcount[] < 0
+  elseif (xs.storage::ArrayStorage).refcount[] < 0
     throw(ArgumentError("Cannot free an unmanaged buffer."))
   end
 
-  refcount = Threads.atomic_add!(xs.storage.refcount, -1)
+  refcount = Threads.atomic_add!((xs.storage::ArrayStorage).refcount, -1)
   if refcount == 1
     context!(context(xs); skip_destroyed=true) do
-      free(xs.storage.buffer; stream)
+      free((xs.storage::ArrayStorage).buffer; stream)
     end
   end
 
@@ -178,7 +229,7 @@ end
 
 
 """
-  unsafe_wrap(::CuArray, ptr::CuPtr{T}, dims; own=false, ctx=context())
+  unsafe_wrap(CuArray, ptr::CuPtr{T}, dims; own=false, ctx=context())
 
 Wrap a `CuArray` object around the data at the address given by `ptr`. The pointer
 element type `T` determines the array element type. `dims` is either an integer (for a 1d
@@ -189,7 +240,24 @@ take ownership of the memory, calling `cudaFree` when the array is no longer ref
 function Base.unsafe_wrap(::Union{Type{CuArray},Type{CuArray{T}},Type{CuArray{T,N}}},
                           ptr::CuPtr{T}, dims::NTuple{N,Int};
                           own::Bool=false, ctx::CuContext=context()) where {T,N}
-  Base.isbitstype(T) || error("Can only unsafe_wrap a pointer to a bits type")
+  buf = _unsafe_wrap(T, ptr, dims; own, ctx)
+  storage = ArrayStorage(buf, own ? 1 : -1)
+  CuArray{T, length(dims)}(storage, dims)
+end
+function Base.unsafe_wrap(::Type{CuArray{T,N,B}},
+                          ptr::CuPtr{T}, dims::NTuple{N,Int};
+                          own::Bool=false, ctx::CuContext=context()) where {T,N,B}
+  buf = _unsafe_wrap(T, ptr, dims; own, ctx)
+  if typeof(buf) !== B
+    error("Declared buffer type does not match inferred buffer type.")
+  end
+  storage = ArrayStorage(buf, own ? 1 : -1)
+  CuArray{T, length(dims)}(storage, dims)
+end
+
+function _unsafe_wrap(::Type{T}, ptr::CuPtr{T}, dims::NTuple{N,Int};
+                      own::Bool=false, ctx::CuContext=context()) where {T,N}
+  isbitstype(T) || error("Can only unsafe_wrap a pointer to a bits type")
   sz = prod(dims) * sizeof(T)
 
   # identify the buffer
@@ -208,14 +276,17 @@ function Base.unsafe_wrap(::Union{Type{CuArray},Type{CuArray{T}},Type{CuArray{T,
   catch err
       error("Could not identify the buffer type; are you passing a valid CUDA pointer to unsafe_wrap?")
   end
-
-  storage = ArrayStorage(buf, own ? 1 : -1)
-  CuArray{T, length(dims)}(storage, dims)
+  return buf
 end
 
 function Base.unsafe_wrap(Atype::Union{Type{CuArray},Type{CuArray{T}},Type{CuArray{T,1}}},
-                          p::CuPtr{T}, dim::Integer;
+                          p::CuPtr{T}, dim::Int;
                           own::Bool=false, ctx::CuContext=context()) where {T}
+  unsafe_wrap(Atype, p, (dim,); own, ctx)
+end
+function Base.unsafe_wrap(Atype::Type{CuArray{T,1,B}},
+                          p::CuPtr{T}, dim::Int;
+                          own::Bool=false, ctx::CuContext=context()) where {T,B}
   unsafe_wrap(Atype, p, (dim,); own, ctx)
 end
 
@@ -232,7 +303,7 @@ Base.sizeof(x::CuArray) = Base.elsize(x) * length(x)
 
 function context(A::CuArray)
   A.storage === nothing && throw(UndefRefError())
-  return A.storage.buffer.ctx
+  return (A.storage::ArrayStorage).buffer.ctx
 end
 
 function device(A::CuArray)
@@ -300,9 +371,9 @@ CuArray{T}(xs::AbstractArray{S,N}) where {T,N,S} = CuArray{T,N}(xs)
 (::Type{CuArray{T,N} where T})(x::AbstractArray{S,N}) where {S,N} = CuArray{S,N}(x)
 CuArray(A::AbstractArray{T,N}) where {T,N} = CuArray{T,N}(A)
 
-# idempotency
-CuArray{T,N,B}(xs::CuArray{T,N,B}) where {T,N,B} = xs
-CuArray{T,N}(xs::CuArray{T,N,B}) where {T,N,B} = xs
+# copy xs to match Array behavior
+CuArray{T,N,B}(xs::CuArray{T,N,B}) where {T,N,B} = copy(xs)
+CuArray{T,N}(xs::CuArray{T,N,B}) where {T,N,B} = copy(xs)
 
 
 ## conversions
@@ -314,14 +385,16 @@ Base.convert(::Type{T}, x::T) where T <: CuArray = x
 
 Base.unsafe_convert(::Type{Ptr{T}}, x::CuArray{T}) where {T} =
   throw(ArgumentError("cannot take the CPU address of a $(typeof(x))"))
-Base.unsafe_convert(::Type{CuPtr{T}}, x::CuArray{T}) where {T} =
-  convert(CuPtr{T}, x.storage.buffer) + x.offset*Base.elsize(x)
+function Base.unsafe_convert(::Type{CuPtr{T}}, x::CuArray{T}) where {T}
+  x.storage === nothing && throw(UndefRefError())
+  convert(CuPtr{T}, (x.storage::ArrayStorage).buffer) + x.offset*Base.elsize(x)
+end
 
 
 ## interop with device arrays
 
 function Base.unsafe_convert(::Type{CuDeviceArray{T,N,AS.Global}}, a::DenseCuArray{T,N}) where {T,N}
-  CuDeviceArray{T,N,AS.Global}(size(a), reinterpret(LLVMPtr{T,AS.Global}, pointer(a)),
+  CuDeviceArray{T,N,AS.Global}(reinterpret(LLVMPtr{T,AS.Global}, pointer(a)), size(a),
                                a.maxsize - a.offset*Base.elsize(a))
 end
 
@@ -518,9 +591,13 @@ end
 Adapt.adapt_storage(::Type{CuArray}, xs::AT) where {AT<:AbstractArray} =
   isbitstype(AT) ? xs : convert(CuArray, xs)
 
-# if an element type is specified, convert to it
+# if specific type parameters are specified, preserve those
 Adapt.adapt_storage(::Type{<:CuArray{T}}, xs::AT) where {T, AT<:AbstractArray} =
   isbitstype(AT) ? xs : convert(CuArray{T}, xs)
+Adapt.adapt_storage(::Type{<:CuArray{T, N}}, xs::AT) where {T, N, AT<:AbstractArray} =
+  isbitstype(AT) ? xs : convert(CuArray{T,N}, xs)
+Adapt.adapt_storage(::Type{<:CuArray{T, N, B}}, xs::AT) where {T, N, B, AT<:AbstractArray} =
+  isbitstype(AT) ? xs : convert(CuArray{T,N,B}, xs)
 
 
 ## opinionated gpu array adaptor
@@ -542,7 +619,50 @@ Adapt.adapt_storage(::CuArrayAdaptor{B}, xs::AbstractArray{T,N}) where {T<:Compl
 Adapt.adapt_storage(::CuArrayAdaptor{B}, xs::AbstractArray{T,N}) where {T<:Union{Float16,BFloat16},N,B} =
   isbits(xs) ? xs : CuArray{T,N,B}(xs)
 
+"""
+    cu(A; unified=false)
+
+Opinionated GPU array adaptor, which may alter the element type `T` of arrays:
+* For `T<:AbstractFloat`, it makes a `CuArray{Float32}` for performance reasons.
+  (Except that `Float16` and `BFloat16` element types are not changed.)
+* For `T<:Complex{<:AbstractFloat}` it makes a `CuArray{ComplexF32}`.
+* For other `isbitstype(T)`, it makes a `CuArray{T}`.
+
+By contrast, `CuArray(A)` never changes the element type.
+
+Uses Adapt.jl to act inside some wrapper structs.
+
+# Examples
+
+```
+julia> cu(ones(3)')
+1×3 adjoint(::CuArray{Float32, 1, CUDA.Mem.DeviceBuffer}) with eltype Float32:
+ 1.0  1.0  1.0
+
+julia> cu(zeros(1, 3); unified=true)
+1×3 CuArray{Float32, 2, CUDA.Mem.UnifiedBuffer}:
+ 0.0  0.0  0.0
+
+julia> cu(1:3)
+1:3
+
+julia> CuArray(ones(3)')  # ignores Adjoint, preserves Float64
+1×3 CuArray{Float64, 2, CUDA.Mem.DeviceBuffer}:
+ 1.0  1.0  1.0
+
+julia> adapt(CuArray, ones(3)')  # this restores Adjoint wrapper
+1×3 adjoint(::CuArray{Float64, 1, CUDA.Mem.DeviceBuffer}) with eltype Float64:
+ 1.0  1.0  1.0
+
+julia> CuArray(1:3)
+3-element CuArray{Int64, 1, CUDA.Mem.DeviceBuffer}:
+ 1
+ 2
+ 3
+```
+"""
 @inline cu(xs; unified::Bool=false) = adapt(CuArrayAdaptor{unified ? Mem.UnifiedBuffer : Mem.DeviceBuffer}(), xs)
+
 Base.getindex(::typeof(cu), xs...) = CuArray([xs...])
 
 
@@ -669,11 +789,11 @@ function Base.reshape(a::CuArray{T,M}, dims::NTuple{N,Int}) where {T,N,M}
       return a
   end
 
-  _derived_array(T, N, a, dims)
+  _derived_array(a, T, dims)
 end
 
 # create a derived array (reinterpreted or reshaped) that's still a CuArray
-@inline function _derived_array(::Type{T}, N::Int, a::CuArray, osize::Dims) where {T}
+@inline function _derived_array(a::CuArray, ::Type{T}, osize::Dims{N}) where {T,N}
   refcount = a.storage.refcount[]
   @assert refcount != 0
   if refcount > 0
@@ -704,7 +824,7 @@ function Base.reinterpret(::Type{T}, a::CuArray{S,N}) where {T,S,N}
     osize = tuple(size1, Base.tail(isize)...)
   end
 
-  return _derived_array(T, N, a, osize)
+  return _derived_array(a, T, osize)
 end
 
 function _reinterpret_exception(::Type{T}, a::AbstractArray{S,N}) where {T,S,N}
@@ -760,7 +880,7 @@ end
 
 function Base.reinterpret(::typeof(reshape), ::Type{T}, a::CuArray) where {T}
   N, osize = _base_check_reshape_reinterpret(T, a)
-  return _derived_array(T, N, a, osize)
+  return _derived_array(a, T, osize)
 end
 
 # taken from reinterpretarray.jl
@@ -819,11 +939,11 @@ created by `unsafe_wrap` with `own=false`.
 function Base.resize!(A::CuVector{T}, n::Integer) where T
   # TODO: add additional space to allow for quicker resizing
   maxsize = n * sizeof(T)
-  bufsize = if Base.isbitsunion(T)
+  bufsize = if isbitstype(T)
+    maxsize
+  else
     # type tag array past the data
     maxsize + n
-  else
-    maxsize
   end
 
   new_storage = context!(context(A)) do

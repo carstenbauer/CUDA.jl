@@ -23,16 +23,23 @@ mutable struct RNG <: AbstractRNG
     function RNG(seed::Integer)
         new(seed%UInt32, 0)
     end
+    RNG(seed::UInt32, counter::UInt32) = new(seed, counter)
 end
 
-RNG() = RNG(Random.rand(UInt32))
+make_seed() = Base.rand(RandomDevice(), UInt32)
+
+RNG() = RNG(make_seed())
+
+Base.copy(rng::RNG) = RNG(rng.seed, rng.counter)
+Base.hash(rng::RNG, h::UInt) = hash(rng.seed, hash(rng.counter, h))
+Base.:(==)(a::RNG, b::RNG) = (a.seed == b.seed) && (a.counter == b.counter)
 
 function Random.seed!(rng::RNG, seed::Integer)
     rng.seed = seed % UInt32
     rng.counter = 0
 end
 
-Random.seed!(rng::RNG) = Random.seed!(rng, Random.rand(UInt32))
+Random.seed!(rng::RNG) = Random.seed!(rng, make_seed())
 
 function Random.rand!(rng::RNG, A::AnyCuArray)
     function kernel(A::AbstractArray{T}, seed::UInt32, counter::UInt32) where {T}
@@ -43,8 +50,8 @@ function Random.rand!(rng::RNG, A::AnyCuArray)
 
         # grid-stride loop
         threadId = threadIdx().x
-        window = (blockDim().x - 1i32) * gridDim().x
-        offset = (blockIdx().x - 1i32) * blockDim().x
+        window = blockDim().x * gridDim().x
+        offset = (blockIdx().x - 1) * blockDim().x
         while offset < length(A)
             i = threadId + offset
             if i <= length(A)
@@ -71,8 +78,8 @@ function Random.rand!(rng::RNG, A::AnyCuArray)
     A
 end
 
-function Random.randn!(rng::RNG, A::AnyCuArray{<:T}) where {T<:Union{AbstractFloat,Complex{<:AbstractFloat}}}
-    function kernel(A::AbstractArray{T}, seed::UInt32, counter::UInt32)
+function Random.randn!(rng::RNG, A::AnyCuArray{<:Union{AbstractFloat,Complex{<:AbstractFloat}}})
+    function kernel(A::AbstractArray{T}, seed::UInt32, counter::UInt32) where {T<:Real}
         device_rng = Random.default_rng()
 
         # initialize the state
@@ -80,14 +87,17 @@ function Random.randn!(rng::RNG, A::AnyCuArray{<:T}) where {T<:Union{AbstractFlo
 
         # grid-stride loop
         threadId = threadIdx().x
-        window = (blockDim().x - 1i32) * gridDim().x
-        offset = (blockIdx().x - 1i32) * blockDim().x
+        window = (blockDim().x - 1) * gridDim().x
+        offset = (blockIdx().x - 1) * blockDim().x
         while offset < length(A)
             i = threadId + offset
             j = threadId + offset + window
             if i <= length(A)
                 # Box–Muller transform
                 U1 = Random.rand(device_rng, T)
+                while U1 == zero(T)
+                    U1 = Random.rand(device_rng, T)
+                end
                 U2 = Random.rand(device_rng, T)
                 Z0 = sqrt(T(-2.0)*log(U1))*cos(T(2pi)*U2)
                 Z1 = sqrt(T(-2.0)*log(U1))*sin(T(2pi)*U2)
@@ -99,7 +109,35 @@ function Random.randn!(rng::RNG, A::AnyCuArray{<:T}) where {T<:Union{AbstractFlo
 
             offset += 2*window
         end
+        return
+    end
 
+    function kernel(A::AbstractArray{Complex{T}}, seed::UInt32, counter::UInt32) where {T<:Real}
+        device_rng = Random.default_rng()
+
+        # initialize the state
+        @inbounds Random.seed!(device_rng, seed, counter)
+
+        # grid-stride loop
+        threadId = threadIdx().x
+        window = (blockDim().x - 1) * gridDim().x
+        offset = (blockIdx().x - 1) * blockDim().x
+        while offset < length(A)
+            i = threadId + offset
+            if i <= length(A)
+                # Complex Box–Muller transform
+                U1 = Random.rand(device_rng, T)
+                while U1 == zero(T)
+                    U1 = Random.rand(device_rng, T)
+                end
+                U2 = Random.rand(device_rng, T)
+                Z0 = sqrt(-log(U1))*cos(T(2pi)*U2)
+                Z1 = sqrt(-log(U1))*sin(T(2pi)*U2)
+                @inbounds A[i] = complex(Z0, Z1)
+            end
+
+            offset += window
+        end
         return
     end
 
@@ -182,45 +220,45 @@ end
 # RNG interface
 
 # GPU arrays
-Random.rand(rng::Union{RNG,GPUArrays.RNG}, T::Type, dims::Dims) =
+Random.rand(rng::RNG, T::Type, dims::Dims) =
     rand!(rng, CuArray{T}(undef, dims))
-Random.randn(rng::Union{RNG,GPUArrays.RNG}, T::Type, dims::Dims) =
+Random.randn(rng::RNG, T::Type, dims::Dims) =
     randn!(rng, CuArray{T}(undef, dims))
 
 # specify default types
-Random.rand(rng::Union{RNG,GPUArrays.RNG}, dims::Dims) =
+Random.rand(rng::RNG, dims::Dims) =
     Random.rand(rng, Float32, dims)
-Random.randn(rng::Union{RNG,GPUArrays.RNG}, dims::Dims) =
+Random.randn(rng::RNG, dims::Dims) =
     Random.randn(rng, Float32, dims)
 
 # support all dimension specifications
-Random.rand(rng::Union{RNG,GPUArrays.RNG}, dim1::Integer, dims::Integer...) =
+Random.rand(rng::RNG, dim1::Integer, dims::Integer...) =
     Random.rand(rng, Dims((dim1, dims...)))
-Random.randn(rng::Union{RNG,GPUArrays.RNG}, dim1::Integer, dims::Integer...) =
+Random.randn(rng::RNG, dim1::Integer, dims::Integer...) =
     Random.randn(rng, Dims((dim1, dims...)))
 # ... and with a type
-Random.rand(rng::Union{RNG,GPUArrays.RNG}, T::Type, dim1::Integer, dims::Integer...) =
+Random.rand(rng::RNG, T::Type, dim1::Integer, dims::Integer...) =
     Random.rand(rng, T, Dims((dim1, dims...)))
-Random.randn(rng::Union{RNG,GPUArrays.RNG}, T::Type, dim1::Integer, dims::Integer...) =
+Random.randn(rng::RNG, T::Type, dim1::Integer, dims::Integer...) =
     Random.randn(rng, T, Dims((dim1, dims...)))
 
 # CPU arrays
-function Random.rand!(rng::Union{RNG,GPUArrays.RNG}, A::AbstractArray{T}) where {T}
+function Random.rand!(rng::RNG, A::AbstractArray{T}) where {T}
     B = CuArray{T}(undef, size(A))
     rand!(rng, B)
     copyto!(A, B)
 end
-function Random.randn!(rng::Union{RNG,GPUArrays.RNG}, A::AbstractArray{T}) where {T}
+function Random.randn!(rng::RNG, A::AbstractArray{T}) where {T}
     B = CuArray{T}(undef, size(A))
     randn!(rng, B)
     copyto!(A, B)
 end
 
 # scalars
-Random.rand(rng::Union{RNG,GPUArrays.RNG}, T::Type=Float32) = Random.rand(rng, T, 1)[]
-Random.randn(rng::Union{RNG,GPUArrays.RNG}, T::Type=Float32) = Random.randn(rng, T, 1)[]
+Random.rand(rng::RNG, T::Type=Float32) = Random.rand(rng, T, 1)[]
+Random.randn(rng::RNG, T::Type=Float32) = Random.randn(rng, T, 1)[]
 # resolve ambiguities
-Random.randn(rng::Union{RNG,GPUArrays.RNG}, T::Random.BitFloatType) = Random.randn(rng, T, 1)[]
+Random.randn(rng::RNG, T::Random.BitFloatType) = Random.randn(rng, T, 1)[]
 
 
 # RNG-less API

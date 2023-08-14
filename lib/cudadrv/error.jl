@@ -56,14 +56,14 @@ function description(err::CuError)
 end
 
 function Base.showerror(io::IO, err::CuError)
-    try
-        print(io, "CUDA error: $(description(err)) (code $(reinterpret(Int32, err.code)), $(name(err)))")
-    catch
+    if !functional()
         # we might throw before the library is initialized
         print(io, "CUDA error (code $(reinterpret(Int32, err.code)), $(err.code))")
+    else
+        print(io, "CUDA error: $(description(err)) (code $(reinterpret(Int32, err.code)), $(name(err)))")
     end
 
-    if err.meta != nothing
+    if err.meta !== nothing
         print(io, "\n")
         print(io, err.meta)
     end
@@ -72,35 +72,3 @@ end
 Base.show(io::IO, ::MIME"text/plain", err::CuError) = print(io, "CuError($(err.code))")
 
 @enum_without_prefix cudaError_enum CUDA_
-
-
-## API call wrapper
-
-@inline function initialize_context()
-    prepare_cuda_state()
-    return
-end
-
-# outlined functionality to avoid GC frame allocation
-@noinline throw_stub_error() =
-    error("Cannot use the CUDA stub libraries. You either don't have the NVIDIA driver installed, or it is not properly discoverable.")
-@noinline function throw_api_error(res)
-    if res == ERROR_OUT_OF_MEMORY
-        throw(OutOfGPUMemoryError())
-    else
-        throw(CuError(res))
-    end
-end
-
-macro check(ex)
-    quote
-        res = $(esc(ex))
-        if res == 0xffffffff
-            throw_stub_error()
-        elseif res != SUCCESS
-            throw_api_error(res)
-        end
-
-        nothing
-    end
-end

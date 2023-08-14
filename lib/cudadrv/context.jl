@@ -203,7 +203,7 @@ function unsafe_release!(ctx::CuContext)
     if isvalid(ctx)
         dev = device(ctx)
         pctx = CuPrimaryContext(dev)
-        if version() >= v"11"
+        if driver_version() >= v"11"
             cuDevicePrimaryCtxRelease_v2(dev)
         else
             cuDevicePrimaryCtxRelease(dev)
@@ -232,7 +232,7 @@ primary context, and as a result outstanding resources might become invalid.
 function unsafe_reset!(pctx::CuPrimaryContext)
     ctx = CuContext(pctx)
     invalidate!(ctx)
-    if version() >= v"11"
+    if driver_version() >= v"11"
         cuDevicePrimaryCtxReset_v2(pctx.dev)
     else
         cuDevicePrimaryCtxReset(pctx.dev)
@@ -267,7 +267,7 @@ flags(pctx::CuPrimaryContext) = state(pctx)[1]
 Set the flags of a primary context.
 """
 function setflags!(pctx::CuPrimaryContext, flags)
-    if version() >= v"11"
+    if driver_version() >= v"11"
         cuDevicePrimaryCtxSetFlags_v2(pctx.dev, flags)
     else
         cuDevicePrimaryCtxSetFlags(pctx.dev, flags)
@@ -299,7 +299,7 @@ associated with the current task.
 function synchronize(ctx::CuContext)
     push!(CuContext, ctx)
     try
-        nonblocking_synchronize()
+        device_synchronize()
     finally
         pop!(CuContext)
     end
@@ -316,20 +316,8 @@ associated with the current task.
 On the device, `device_synchronize` acts as a synchronization point for child grids in the
 context of dynamic parallelism.
 """
-device_synchronize() = nonblocking_synchronize()
+device_synchronize()
 # XXX: can we put the device docstring in dynamic_parallelism.jl?
-
-@inline function nonblocking_synchronize()
-    # perform as much of the sync as possible without blocking in CUDA.
-    # XXX: remove this using a yield callback, or by synchronizing on a dedicated thread?
-    nonblocking_synchronize(legacy_stream())
-
-    # even though the GPU should be idle now, CUDA hooks work to the actual API call.
-    # see NVIDIA bug #3383169 for more details.
-    cuCtxSynchronize()
-
-    check_exceptions()
-end
 
 
 ## cache config

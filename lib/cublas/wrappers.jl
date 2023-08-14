@@ -5,13 +5,17 @@
 
 function cublasCreate()
   handle_ref = Ref{cublasHandle_t}()
-  @check unsafe_cublasCreate_v2(handle_ref) CUBLAS_STATUS_NOT_INITIALIZED
+  check(CUBLAS_STATUS_NOT_INITIALIZED) do
+    unsafe_cublasCreate_v2(handle_ref)
+  end
   handle_ref[]
 end
 
 function cublasXtCreate()
   handle_ref = Ref{cublasXtHandle_t}()
-  @check unsafe_cublasXtCreate(handle_ref) CUBLAS_STATUS_NOT_INITIALIZED
+  check(CUBLAS_STATUS_NOT_INITIALIZED) do
+    unsafe_cublasXtCreate(handle_ref)
+  end
   handle_ref[]
 end
 
@@ -150,10 +154,10 @@ function dot(n::Integer, x::StridedCuArray{Float16}, y::StridedCuArray{Float16})
     return result[]
 end
 function dotc(n::Integer, x::StridedCuArray{ComplexF16}, y::StridedCuArray{ComplexF16})
-    return convert(ComplexF16, dotc(n, convert(CuArray{ComplexF32}, x), convert(CuArray{ComplexF32}, y)))
+    convert(ComplexF16, dotc(n, convert(CuArray{ComplexF32}, x), convert(CuArray{ComplexF32}, y)))
 end
 function dotu(n::Integer, x::StridedCuArray{ComplexF16}, y::DenseCuArray{ComplexF16})
-    return convert(ComplexF16, dotu(n, convert(CuArray{ComplexF32}, x), convert(CuArray{ComplexF32}, y)))
+    convert(ComplexF16, dotu(n, convert(CuArray{ComplexF32}, x), convert(CuArray{ComplexF32}, y)))
 end
 
 ## nrm2
@@ -180,7 +184,7 @@ end
 function nrm2(n::Integer, x::StridedCuArray{ComplexF16})
     wide_x = widen.(x)
     nrm    = nrm2(n, wide_x)
-    return convert(ComplexF16, nrm)
+    return convert(Float16, nrm)
 end
 
 ## asum
@@ -317,25 +321,105 @@ for (fname, elty) in ((:cublasDgemv_v2,:Float64),
         function gemv!(trans::Char,
                        alpha::Number,
                        A::StridedCuMatrix{$elty},
-                       X::StridedCuVector{$elty},
+                       x::StridedCuVector{$elty},
                        beta::Number,
-                       Y::StridedCuVector{$elty})
+                       y::StridedCuVector{$elty})
             # handle trans
             m,n = size(A)
             # check dimensions
-            length(X) == (trans == 'N' ? n : m) && length(Y) == (trans == 'N' ? m : n) || throw(DimensionMismatch(""))
+            length(x) == (trans == 'N' ? n : m) && length(y) == (trans == 'N' ? m : n) || throw(DimensionMismatch(""))
             # compute increments
             lda = max(1,stride(A,2))
-            incx = stride(X,1)
-            incy = stride(Y,1)
-            $fname(handle(), trans, m, n, alpha, A, lda, X, incx, beta, Y, incy)
-            Y
+            incx = stride(x,1)
+            incy = stride(y,1)
+            $fname(handle(), trans, m, n, alpha, A, lda, x, incx, beta, y, incy)
+            y
         end
-        function gemv(trans::Char, alpha::Number, A::StridedCuMatrix{$elty}, X::StridedCuVector{$elty})
-            gemv!(trans, alpha, A, X, zero($elty), similar(X, $elty, size(A, (trans == 'N' ? 1 : 2))))
+    end
+end
+function gemv(trans::Char, alpha::Number,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    gemv!(trans, alpha, A, x, zero(T), similar(x, size(A, (trans == 'N' ? 1 : 2))))
+end
+function gemv(trans::Char, A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    gemv!(trans, one(T), A, x, zero(T), similar(x, T, size(A, (trans == 'N' ? 1 : 2))))
+end
+
+for (fname, eltyin, eltyout) in
+    ((:cublasDgemvBatched,:Float64, :Float64),
+     (:cublasSgemvBatched,:Float32, :Float32),
+     (:cublasHSHgemvBatched,:Float16, :Float16),
+     (:cublasHSSgemvBatched,:Float16, :Float32),
+     (:cublasZgemvBatched,:ComplexF64, :ComplexF64),
+     (:cublasCgemvBatched,:ComplexF32, :ComplexF32))
+    @eval begin
+        function gemv_batched!(trans::Char,
+                            alpha::Number,
+                            A::Vector{<:StridedCuMatrix{$eltyin}},
+                            x::Vector{<:StridedCuVector{$eltyin}},
+                            beta::Number,
+                            y::Vector{<:StridedCuVector{$eltyout}})
+            if length(A) != length(x) || length(A) != length(y)
+                throw(DimensionMismatch("Lengths of inputs must be the same"))
+            end
+            for (i, (As,xs,ys)) in enumerate(zip(A,x,y))
+                m,n = size(As)
+                if length(xs) != (trans == 'N' ? n : m) || length(ys) != (trans == 'N' ? m : n)
+                    throw(DimensionMismatch("Input $i: A has dimension $(size(As)), x has dimension $(size(xs)), y has dimension $(size(ys))"))
+                end
+            end
+
+            m = size(A[1], trans == 'N' ? 1 : 2)
+            n = size(A[1], trans == 'N' ? 2 : 1)
+            lda = max(1,stride(A[1],2))
+            incx = stride(x[1],1)
+            incy = stride(y[1],1)
+            Aptrs = unsafe_batch(A)
+            xptrs = unsafe_batch(x)
+            yptrs = unsafe_batch(y)
+            $fname(handle(), trans, m, n, alpha, Aptrs, lda, xptrs, incx, beta, yptrs, incy, length(A))
+            unsafe_free!(yptrs)
+            unsafe_free!(xptrs)
+            unsafe_free!(Aptrs)
+
+            y
         end
-        function gemv(trans::Char, A::StridedCuMatrix{$elty}, X::StridedCuVector{$elty})
-            gemv!(trans, one($elty), A, X, zero($elty), similar(X, $elty, size(A, (trans == 'N' ? 1 : 2))))
+    end
+end
+
+for (fname, eltyin, eltyout) in
+    ((:cublasDgemvStridedBatched,:Float64, :Float64),
+     (:cublasSgemvStridedBatched,:Float32, :Float32),
+     (:cublasHSHgemvStridedBatched,:Float16, :Float16),
+     (:cublasHSSgemvStridedBatched,:Float16, :Float32),
+     (:cublasZgemvStridedBatched,:ComplexF64, :ComplexF64),
+     (:cublasCgemvStridedBatched,:ComplexF32, :ComplexF32))
+    @eval begin
+        function gemv_strided_batched!(trans::Char,
+                            alpha::Number,
+                            A::AbstractArray{$eltyin, 3},
+                            x::AbstractArray{$eltyin, 2},
+                            beta::Number,
+                            y::AbstractArray{$eltyout, 2})
+            if size(A, 3) != size(x, 2) || size(A, 3) != size(y, 2)
+                throw(DimensionMismatch("Batch sizes must be equal for all inputs"))
+            end
+            m = size(A, trans == 'N' ? 1 : 2)
+            n = size(A, trans == 'N' ? 2 : 1)
+            if m != size(y, 1) || n != size(x, 1)
+                throw(DimensionMismatch("A has dimension $(size(A)), x has dimension $(size(x)), y has dimension $(size(y))"))
+            end
+
+            lda = max(1,stride(A, 2))
+            incx = stride(x,1)
+            incy = stride(y,1)
+            strideA = size(A, 3) == 1 ? 0 : stride(A, 3)
+            stridex = size(x, 2) == 1 ? 0 : stride(x, 2)
+            stridey = stride(y, 2)
+            batchCount = size(A, 3)
+            $fname(handle(), trans, m, n, alpha, A, lda, strideA, x, incx, stridex, beta, y, incy, stridey, batchCount)
+
+            y
         end
     end
 end
@@ -365,27 +449,18 @@ for (fname, elty) in ((:cublasDgbmv_v2,:Float64),
             $fname(handle(), trans, m, n, kl, ku, alpha, A, lda, x, incx, beta, y, incy)
             y
         end
-        function gbmv(trans::Char,
-                      m::Integer,
-                      kl::Integer,
-                      ku::Integer,
-                      alpha::Number,
-                      A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            # TODO: fix gbmv bug in julia
-            n = size(A,2)
-            leny = trans == 'N' ? m : n
-            gbmv!(trans, m, kl, ku, alpha, A, x, zero($elty), similar(x, $elty, leny))
-        end
-        function gbmv(trans::Char,
-                      m::Integer,
-                      kl::Integer,
-                      ku::Integer,
-                      A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            gbmv(trans, m, kl, ku, one($elty), A, x)
-        end
     end
+end
+function gbmv(trans::Char, m::Integer, kl::Integer, ku::Integer, alpha::Number,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    # TODO: fix gbmv bug in julia
+    n = size(A,2)
+    leny = trans == 'N' ? m : n
+    gbmv!(trans, m, kl, ku, alpha, A, x, zero(T), similar(x, leny))
+end
+function gbmv(trans::Char, m::Integer, kl::Integer, ku::Integer,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    gbmv(trans, m, kl, ku, one(T), A, x)
 end
 
 ### spmv
@@ -405,13 +480,14 @@ for (fname, elty) in ((:cublasDspmv_v2,:Float64),
             $fname(handle(), uplo, n, alpha, AP, x, incx, beta, y, incy)
             y
         end
-        function spmv(uplo::Char, alpha::Number, AP::StridedCuVector{$elty}, x::StridedCuVector{$elty})
-                spmv!(uplo, alpha, AP, x, zero($elty), similar(x))
-        end
-        function spmv(uplo::Char, AP::StridedCuVector{$elty}, x::StridedCuVector{$elty})
-            spmv(uplo, one($elty), AP, x)
-        end
     end
+end
+function spmv(uplo::Char, alpha::Number,
+              AP::StridedCuVector{T}, x::StridedCuVector{T}) where T
+    spmv!(uplo, alpha, AP, x, zero(T), similar(x))
+end
+function spmv(uplo::Char, AP::StridedCuVector{T}, x::StridedCuVector{T}) where T
+    spmv(uplo, one(T), AP, x)
 end
 
 ### symv
@@ -436,13 +512,14 @@ for (fname, elty) in ((:cublasDsymv_v2,:Float64),
             $fname(handle(), uplo, n, alpha, A, lda, x, incx, beta, y, incy)
             y
         end
-        function symv(uplo::Char, alpha::Number, A::StridedCuMatrix{$elty}, x::StridedCuVector{$elty})
-                symv!(uplo, alpha, A, x, zero($elty), similar(x))
-        end
-        function symv(uplo::Char, A::StridedCuMatrix{$elty}, x::StridedCuVector{$elty})
-            symv(uplo, one($elty), A, x)
-        end
     end
+end
+function symv(uplo::Char, alpha::Number,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+        symv!(uplo, alpha, A, x, zero(T), similar(x))
+end
+function symv(uplo::Char, A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    symv(uplo, one(T), A, x)
 end
 
 ### hemv
@@ -466,15 +543,15 @@ for (fname, elty) in ((:cublasZhemv_v2,:ComplexF64),
             $fname(handle(), uplo, n, alpha, A, lda, x, incx, beta, y, incy)
             y
         end
-        function hemv(uplo::Char, alpha::Number, A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            hemv!(uplo, alpha, A, x, zero($elty), similar(x))
-        end
-        function hemv(uplo::Char, A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            hemv(uplo, one($elty), A, x)
-        end
     end
+end
+function hemv(uplo::Char, alpha::Number, A::StridedCuMatrix{T},
+              x::StridedCuVector{T}) where T
+    hemv!(uplo, alpha, A, x, zero(T), similar(x))
+end
+function hemv(uplo::Char, A::StridedCuMatrix{T},
+              x::StridedCuVector{T}) where T
+    hemv(uplo, one(T), A, x)
 end
 
 ### sbmv, (SB) symmetric banded matrix-vector multiplication
@@ -501,16 +578,16 @@ for (fname, elty) in ((:cublasDsbmv_v2,:Float64),
             $fname(handle(), uplo, n, k, alpha, A, lda, x, incx, beta, y, incy)
             y
         end
-        function sbmv(uplo::Char, k::Integer, alpha::Number,
-                      A::StridedCuMatrix{$elty}, x::StridedCuVector{$elty})
-            n = size(A,2)
-            sbmv!(uplo, k, alpha, A, x, zero($elty), similar(x, $elty, n))
-        end
-        function sbmv(uplo::Char, k::Integer, A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            sbmv(uplo, k, one($elty), A, x)
-        end
     end
+end
+function sbmv(uplo::Char, k::Integer, alpha::Number,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    n = size(A,2)
+    sbmv!(uplo, k, alpha, A, x, zero(T), similar(x, n))
+end
+function sbmv(uplo::Char, k::Integer, A::StridedCuMatrix{T},
+              x::StridedCuVector{T}) where T
+    sbmv(uplo, k, one(T), A, x)
 end
 
 ### hbmv, (HB) Hermitian banded matrix-vector multiplication
@@ -534,16 +611,16 @@ for (fname, elty) in ((:cublasZhbmv_v2,:ComplexF64),
             $fname(handle(), uplo, n, k, alpha, A, lda, x, incx, beta, y, incy)
             y
         end
-        function hbmv(uplo::Char, k::Integer, alpha::Number,
-                      A::StridedCuMatrix{$elty}, x::StridedCuVector{$elty})
-            n = size(A,2)
-            hbmv!(uplo, k, alpha, A, x, zero($elty), similar(x, $elty, n))
-        end
-        function hbmv(uplo::Char, k::Integer, A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            hbmv(uplo, k, one($elty), A, x)
-        end
     end
+end
+function hbmv(uplo::Char, k::Integer, alpha::Number,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    n = size(A,2)
+    hbmv!(uplo, k, alpha, A, x, zero(T), similar(x, n))
+end
+function hbmv(uplo::Char, k::Integer, A::StridedCuMatrix{T},
+              x::StridedCuVector{T}) where T
+    hbmv(uplo, k, one(T), A, x)
 end
 
 ### tbmv, (TB) triangular banded matrix-vector multiplication
@@ -567,15 +644,11 @@ for (fname, elty) in ((:cublasStbmv_v2,:Float32),
             $fname(handle(), uplo, trans, diag, n, k, A, lda, x, incx)
             x
         end
-        function tbmv(uplo::Char,
-                      trans::Char,
-                      diag::Char,
-                      k::Integer,
-                      A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            tbmv!(uplo, trans, diag, k, A, copy(x))
-        end
     end
+end
+function tbmv(uplo::Char, trans::Char, diag::Char, k::Integer,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    tbmv!(uplo, trans, diag, k, A, copy(x))
 end
 
 ### tbsv, (TB) triangular banded matrix solve
@@ -599,15 +672,11 @@ for (fname, elty) in ((:cublasStbsv_v2,:Float32),
             $fname(handle(), uplo, trans, diag, n, k, A, lda, x, incx)
             x
         end
-        function tbsv(uplo::Char,
-                      trans::Char,
-                      diag::Char,
-                      k::Integer,
-                      A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            tbsv!(uplo, trans, diag, k, A, copy(x))
-        end
     end
+end
+function tbsv(uplo::Char, trans::Char, diag::Char, k::Integer,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    tbsv!(uplo, trans, diag, k, A, copy(x))
 end
 
 ### trmv, Triangular matrix-vector multiplication
@@ -631,14 +700,11 @@ for (fname, elty) in ((:cublasDtrmv_v2,:Float64),
             $fname(handle(), uplo, trans, diag, n, A, lda, x, incx)
             x
         end
-        function trmv(uplo::Char,
-                      trans::Char,
-                      diag::Char,
-                      A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            trmv!(uplo, trans, diag, A, copy(x))
-        end
     end
+end
+function trmv(uplo::Char, trans::Char, diag::Char,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    trmv!(uplo, trans, diag, A, copy(x))
 end
 
 ### trsv, Triangular matrix-vector solve
@@ -662,14 +728,11 @@ for (fname, elty) in ((:cublasDtrsv_v2,:Float64),
             $fname(handle(), uplo, trans, diag, n, A, lda, x, incx)
             x
         end
-        function trsv(uplo::Char,
-                      trans::Char,
-                      diag::Char,
-                      A::StridedCuMatrix{$elty},
-                      x::StridedCuVector{$elty})
-            trsv!(uplo, trans, diag, A, copy(x))
-        end
     end
+end
+function trsv(uplo::Char, trans::Char, diag::Char,
+              A::StridedCuMatrix{T}, x::StridedCuVector{T}) where T
+    trsv!(uplo, trans, diag, A, copy(x))
 end
 
 ### ger
@@ -802,22 +865,17 @@ for (fname, elty) in
             $fname(handle(), transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
             C
         end
-        function gemm(transA::Char,
-                      transB::Char,
-                      alpha::Number,
-                      A::StridedCuVecOrMat{$elty},
-                      B::StridedCuVecOrMat{$elty})
-            gemm!(transA, transB, alpha, A, B, zero($elty),
-                  similar(B, $elty, (size(A, transA == 'N' ? 1 : 2),
-                                     size(B, transB == 'N' ? 2 : 1))))
-        end
-        function gemm(transA::Char,
-                      transB::Char,
-                      A::StridedCuVecOrMat{$elty},
-                      B::StridedCuVecOrMat{$elty})
-            gemm(transA, transB, one($elty), A, B)
-        end
     end
+end
+function gemm(transA::Char, transB::Char, alpha::Number,
+              A::StridedCuVecOrMat{T}, B::StridedCuVecOrMat{T}) where T
+    gemm!(transA, transB, alpha, A, B, zero(T),
+          similar(B, (size(A, transA == 'N' ? 1 : 2),
+                      size(B, transB == 'N' ? 2 : 1))))
+end
+function gemm(transA::Char, transB::Char,
+              A::StridedCuVecOrMat{T}, B::StridedCuVecOrMat{T}) where T
+    gemm(transA, transB, one(T), A, B)
 end
 
 function gemmExComputeType(TA, TB, TC, m, k, n)
@@ -845,11 +903,16 @@ function gemmExComputeType(TA, TB, TC, m, k, n)
         return math_mode==CUDA.PEDANTIC_MATH ? CUBLAS_COMPUTE_16F_PEDANTIC : CUBLAS_COMPUTE_16F
     end
 
-    if m%4 == 0 && n%4 == 0 && k%4 == 0 && sig === (Int8, Int32)
-        CUDA.version() >= v"11.2" && return nothing # NVIDIA bug #3221266
+    if sig === (Int8, Int32)
+        # starting with CUDA 11.2, this is unsupported (NVIDIA bug #3221266)
+        # TODO: might be fixed in a later version?
+        version() >= v"11.3.1" && return nothing
+
         # Int32=Int8*Int8 requires m,n,k to be multiples of 4
         # https://forums.developer.nvidia.com/t/cublasgemmex-cant-use-cuda-r-8i-compute-type-on-gtx1080/58100/2
-        return math_mode==CUDA.PEDANTIC_MATH ? CUBLAS_COMPUTE_32I_PEDANTIC : CUBLAS_COMPUTE_32I
+        if m%4 == 0 && n%4 == 0 && k%4 == 0
+            return math_mode==CUDA.PEDANTIC_MATH ? CUBLAS_COMPUTE_32I_PEDANTIC : CUBLAS_COMPUTE_32I
+        end
     end
 
     if math_mode == CUDA.FAST_MATH
@@ -903,7 +966,7 @@ function gemmEx!(transA::Char, transB::Char,
     k = size(A, transA == 'N' ? 2 : 1)
     n = size(B, transB == 'N' ? 2 : 1)
     if m != size(C,1) || n != size(C,2) || k != size(B, transB == 'N' ? 1 : 2)
-        throw(DimensionMismatch(""))
+        throw(DimensionMismatch("A has dimension $(size(A)), B has dimension $(size(B)) and C has dimension $(size(C))"))
     end
     lda = max(1,stride(A,2))
     ldb = max(1,stride(B,2))
@@ -912,13 +975,101 @@ function gemmEx!(transA::Char, transB::Char,
     isnothing(computeType) &&
         throw(ArgumentError("gemmEx does not support $(eltype(C))=$(eltype(A))*$(eltype(B))"))
     computeT = juliaStorageType(eltype(C), computeType)
-    if version() < v"11.0"
+    if version() >= v"11.0"
         # with CUDA 11, the compute type encodes the math mode.
+        cublasGemmEx(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), A, eltype(A), lda, B,
+                    eltype(B), ldb, Ref{computeT}(beta), C, eltype(C), ldc, computeType, algo)
+    else
         # before CUDA 11, it was a plain cudaDataType.
         computeType = convert(cudaDataType, computeT)
+        cublasGemmEx_old(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), A, eltype(A), lda, B,
+                    eltype(B), ldb, Ref{computeT}(beta), C, eltype(C), ldc, computeType, algo)
     end
-    cublasGemmEx(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), A, eltype(A), lda, B,
-                 eltype(B), ldb, Ref{computeT}(beta), C, eltype(C), ldc, computeType, algo)
+    C
+end
+
+function gemmBatchedEx!(transA::Char, transB::Char,
+                 @nospecialize(alpha::Number),
+                 @nospecialize(A::Vector{<:StridedCuVecOrMat}),
+                 @nospecialize(B::Vector{<:StridedCuVecOrMat}),
+                 @nospecialize(beta::Number),
+                 @nospecialize(C::Vector{<:StridedCuVecOrMat});
+                 algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT)
+    if length(A) != length(B) || length(A) != length(C)
+        throw(DimensionMismatch("Lengths of inputs must be the same"))
+    end
+    for (i, (As,Bs,Cs)) in enumerate(zip(A,B,C))
+        m = size(As, transA == 'N' ? 1 : 2)
+        k = size(As, transA == 'N' ? 2 : 1)
+        n = size(Bs, transB == 'N' ? 2 : 1)
+        if m != size(Cs,1) || n != size(Cs,2) || k != size(Bs, transB == 'N' ? 1 : 2)
+            throw(DimensionMismatch("Input $i: A has dimension $(size(As)), B has dimension $(size(Bs)), C has dimension $(size(Cs))"))
+        end
+    end
+    m = size(A[1], transA == 'N' ? 1 : 2)
+    k = size(A[1], transA == 'N' ? 2 : 1)
+    n = size(B[1], transB == 'N' ? 2 : 1)
+    lda = max(1,stride(A[1],2))
+    ldb = max(1,stride(B[1],2))
+    ldc = max(1,stride(C[1],2))
+    computeType = gemmExComputeType(eltype(A[1]), eltype(B[1]), eltype(C[1]), m, k, n)
+    isnothing(computeType) &&
+    throw(ArgumentError("gemmEx does not support $(eltype(C))=$(eltype(A))*$(eltype(B))"))
+    computeT = juliaStorageType(eltype(C[1]), computeType)
+    Aptrs = unsafe_batch(A)
+    Bptrs = unsafe_batch(B)
+    Cptrs = unsafe_batch(C)
+    if version() >= v"11.0"
+        # with CUDA 11, the compute type encodes the math mode.
+        cublasGemmBatchedEx(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), Aptrs, eltype(A[1]), lda, Bptrs,
+                            eltype(B[1]), ldb, Ref{computeT}(beta), Cptrs, eltype(C[1]), ldc, length(A), computeType, algo)
+    else
+        error("Not implemented for CUDA 11 and below.")
+    end
+    unsafe_free!(Cptrs)
+    unsafe_free!(Bptrs)
+    unsafe_free!(Aptrs)
+
+    C
+end
+
+function gemmStridedBatchedEx!(transA::Char, transB::Char,
+                 @nospecialize(alpha::Number),
+                 @nospecialize(A::AbstractArray{Ta, 3}),
+                 @nospecialize(B::AbstractArray{Tb, 3}),
+                 @nospecialize(beta::Number),
+                 @nospecialize(C::AbstractArray{Tc, 3});
+                 algo::cublasGemmAlgo_t=CUBLAS_GEMM_DEFAULT) where {Ta, Tb, Tc}
+    if size(A, 3) != size(B, 3) || size(A, 3) != size(C, 3)
+        throw(DimensionMismatch("Batch sizes must be equal for all inputs"))
+    end
+    m = size(A, transA == 'N' ? 1 : 2)
+    k = size(A, transA == 'N' ? 2 : 1)
+    n = size(B, transB == 'N' ? 2 : 1)
+    if m != size(C,1) || n != size(C,2) || k != size(B, transB == 'N' ? 1 : 2)
+        throw(DimensionMismatch("A has dimension $(size(A)), B has dimension $(size(B)), C has dimension $(size(C))"))
+    end
+    lda = max(1,stride(A,2))
+    ldb = max(1,stride(B,2))
+    ldc = max(1,stride(C,2))
+
+    strideA = size(A, 3) == 1 ? 0 : stride(A, 3)
+    strideB = size(B, 3) == 1 ? 0 : stride(B, 3)
+    strideC = stride(C, 3)
+    batchCount = size(C, 3)
+
+    computeType = gemmExComputeType(eltype(A), eltype(B), eltype(C), m, k, n)
+    isnothing(computeType) &&
+    throw(ArgumentError("gemmEx does not support $(eltype(C))=$(eltype(A))*$(eltype(B))"))
+    computeT = juliaStorageType(eltype(C), computeType)
+    if version() >= v"11.0"
+        # with CUDA 11, the compute type encodes the math mode.
+        cublasGemmStridedBatchedEx(handle(), transA, transB, m, n, k, Ref{computeT}(alpha), A, eltype(A), lda, strideA,
+                                   B, eltype(B), ldb, strideB, Ref{computeT}(beta), C, eltype(C), ldc, strideC,
+                                   batchCount, computeType, algo)
+    else
+        error("Not implemented for CUDA 11 and below.")
+    end
     C
 end
 
@@ -980,23 +1131,18 @@ for (fname, elty) in
 
             C
         end
-        function gemm_batched(transA::Char,
-                      transB::Char,
-                      alpha::Number,
-                      A::Vector{<:StridedCuMatrix{$elty}},
-                      B::Vector{<:StridedCuMatrix{$elty}})
-            C = CuMatrix{$elty}[similar( B[1], $elty, (size(A[1], transA == 'N' ? 1 : 2),size(B[1], transB == 'N' ? 2 : 1))) for i in 1:length(A)]
-            gemm_batched!(transA, transB, alpha, A, B, zero($elty), C )
-        end
-        function gemm_batched(transA::Char,
-                      transB::Char,
-                      A::Vector{<:StridedCuMatrix{$elty}},
-                      B::Vector{<:StridedCuMatrix{$elty}})
-            gemm_batched(transA, transB, one($elty), A, B)
-        end
     end
 end
 
+function gemm_batched(transA::Char, transB::Char, alpha::Number,
+                      A::Vector{<:StridedCuMatrix{T}}, B::Vector{<:StridedCuMatrix{T}}) where T
+    C = CuMatrix{T}[similar(B[1], (size(A[1], transA == 'N' ? 1 : 2),size(B[1], transB == 'N' ? 2 : 1))) for i in 1:length(A)]
+    gemm_batched!(transA, transB, alpha, A, B, zero(T), C )
+end
+function gemm_batched(transA::Char, transB::Char,
+                      A::Vector{<:StridedCuMatrix{T}}, B::Vector{<:StridedCuMatrix{T}}) where T
+    gemm_batched(transA, transB, one(T), A, B)
+end
 
 ## (GE) general matrix-matrix multiplication strided batched
 for (fname, elty) in
@@ -1035,24 +1181,21 @@ for (fname, elty) in
                   ldb, strideB, beta, C, ldc, strideC, batchCount)
            C
         end
-        function gemm_strided_batched(transA::Char,
-                      transB::Char,
-                      alpha::Number,
-                      A::AbstractArray{$elty, 3},
-                      B::AbstractArray{$elty, 3})
-            C = similar(B, (size(A, transA == 'N' ? 1 : 2), size(B, transB == 'N' ? 2 : 1), max(size(A, 3), size(B, 3))))
-            gemm_strided_batched!(transA, transB, alpha, A, B, zero($elty), C )
-        end
-        function gemm_strided_batched(transA::Char,
-                      transB::Char,
-                      A::AbstractArray{$elty, 3},
-                      B::AbstractArray{$elty, 3})
-            gemm_strided_batched(transA, transB, one($elty), A, B)
-        end
     end
 end
+function gemm_strided_batched(transA::Char, transB::Char, alpha::Number,
+                              A::AbstractArray{T, 3}, B::AbstractArray{T, 3}) where T
+    C = similar(B, (size(A, transA == 'N' ? 1 : 2),
+                    size(B, transB == 'N' ? 2 : 1),
+                    max(size(A, 3), size(B, 3))))
+    gemm_strided_batched!(transA, transB, alpha, A, B, zero(T), C )
+end
+function gemm_strided_batched(transA::Char, transB::Char, A::AbstractArray{T, 3},
+                              B::AbstractArray{T, 3}) where T
+    gemm_strided_batched(transA, transB, one(T), A, B)
+end
 
-## (SY) symmetric matrix-matrix and matrix-vector multiplication
+## (Sy) symmetric matrix-matrix and matrix-vector multiplication
 for (fname, elty) in ((:cublasDsymm_v2,:Float64),
                       (:cublasSsymm_v2,:Float32),
                       (:cublasZsymm_v2,:ComplexF64),
@@ -1080,20 +1223,15 @@ for (fname, elty) in ((:cublasDsymm_v2,:Float64),
                    beta, C, ldc)
             C
         end
-        function symm(side::Char,
-                      uplo::Char,
-                      alpha::Number,
-                      A::StridedCuMatrix{$elty},
-                      B::StridedCuMatrix{$elty})
-            symm!(side, uplo, alpha, A, B, zero($elty), similar(B))
-        end
-        function symm(side::Char,
-                      uplo::Char,
-                      A::StridedCuMatrix{$elty},
-                      B::StridedCuMatrix{$elty})
-            symm(side, uplo, one($elty), A, B)
-        end
     end
+end
+function symm(side::Char, uplo::Char, alpha::Number,
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    symm!(side, uplo, alpha, A, B, zero(T), similar(B))
+end
+function symm(side::Char, uplo::Char,
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    symm(side, uplo, one(T), A, B)
 end
 
 ## syrk
@@ -1120,16 +1258,13 @@ for (fname, elty) in ((:cublasDsyrk_v2,:Float64),
         end
     end
 end
-function syrk(uplo::Char,
-              trans::Char,
-              alpha::Number,
-              A::StridedCuVecOrMat)
-    T = eltype(A)
+function syrk(uplo::Char, trans::Char, alpha::Number, A::StridedCuVecOrMat{T}) where T
     n = size(A, trans == 'N' ? 1 : 2)
-    syrk!(uplo, trans, alpha, A, zero(T), similar(A, T, (n, n)))
+    syrk!(uplo, trans, alpha, A, zero(T), similar(A, (n, n)))
 end
-syrk(uplo::Char, trans::Char, A::StridedCuVecOrMat) =
+function syrk(uplo::Char, trans::Char, A::StridedCuVecOrMat)
     syrk(uplo, trans, one(eltype(A)), A)
+end
 
 for (fname, elty) in ((:cublasDsyrkx,:Float64),
                       (:cublasSsyrkx,:Float32),
@@ -1156,18 +1291,14 @@ for (fname, elty) in ((:cublasDsyrkx,:Float64),
         end
     end
 end
-function syrkx(uplo::Char,
-              trans::Char,
-              alpha::Number,
-              A::StridedCuVecOrMat,
-              beta::Number,
-              B::StridedCuVecOrMat)
-    T = eltype(A)
+function syrkx(uplo::Char, trans::Char, alpha::Number, A::StridedCuVecOrMat{T},
+                beta::Number, B::StridedCuVecOrMat{T}) where T
     n = size(A, trans == 'N' ? 1 : 2)
-    syrkx!(uplo, trans, convert(T,alpha), A, B, convert(T,beta), similar(A, T, (n, n)))
+    syrkx!(uplo, trans, alpha, A, B, beta, similar(A, (n, n)))
 end
-syrkx(uplo::Char, trans::Char, A::StridedCuVecOrMat, B::StridedCuVecOrMat) =
-    syrkx(uplo, trans, one(eltype(A)), A, zero(eltype(B)), B)
+function syrkx(uplo::Char, trans::Char, A::StridedCuVecOrMat{T}, B::StridedCuVecOrMat{T}) where T
+    syrkx(uplo, trans, one(T), A, zero(T), B)
+end
 
 ## hemm
 for (fname, elty) in ((:cublasZhemm_v2,:ComplexF64),
@@ -1193,17 +1324,15 @@ for (fname, elty) in ((:cublasZhemm_v2,:ComplexF64),
             $fname(handle(), side, uplo, m, n, alpha, A, lda, B, ldb, beta, C, ldc)
             C
         end
-        function hemm(uplo::Char,
-                      trans::Char,
-                      alpha::Number,
-                      A::StridedCuMatrix{$elty},
-                      B::StridedCuMatrix{$elty})
-            m,n = size(B)
-            hemm!( uplo, trans, alpha, A, B, zero($elty), similar(B, $elty, (m,n) ) )
-        end
-        hemm( uplo::Char, trans::Char, A::StridedCuMatrix{$elty}, B::StridedCuMatrix{$elty}) =
-            hemm( uplo, trans, one($elty), A, B)
     end
+end
+function hemm(uplo::Char, trans::Char, alpha::Number,
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    m,n = size(B)
+    hemm!( uplo, trans, alpha, A, B, zero(T), similar(B, (m,n) ) )
+end
+function hemm(uplo::Char, trans::Char, A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    hemm(uplo, trans, one(T), A, B)
 end
 
 ## herk
@@ -1226,13 +1355,14 @@ for (fname, elty) in ((:cublasZherk_v2,:ComplexF64),
             $fname(handle(), uplo, trans, n, k, alpha, A, lda, beta, C, ldc)
             C
         end
-        function herk(uplo::Char, trans::Char, alpha::Real, A::StridedCuVecOrMat{$elty})
-            n = size(A, trans == 'N' ? 1 : 2)
-            herk!(uplo, trans, alpha, A, zero(real($elty)), similar(A, $elty, (n,n)))
-        end
-        herk(uplo::Char, trans::Char, A::StridedCuVecOrMat{$elty}) =
-            herk(uplo, trans, one(real($elty)), A)
    end
+end
+function herk(uplo::Char, trans::Char, alpha::Real, A::StridedCuVecOrMat{T}) where T
+    n = size(A, trans == 'N' ? 1 : 2)
+    herk!(uplo, trans, alpha, A, zero(real(T)), similar(A, (n,n)))
+end
+function herk(uplo::Char, trans::Char, A::StridedCuVecOrMat{T}) where T
+    herk(uplo, trans, one(real(T)), A)
 end
 
 ## syr2k
@@ -1275,8 +1405,9 @@ function syr2k(uplo::Char,
     n = size(A, trans == 'N' ? 1 : 2)
     syr2k!(uplo, trans, convert(T,alpha), A, B, zero(T), similar(A, T, (n, n)))
 end
-syr2k(uplo::Char, trans::Char, A::StridedCuVecOrMat, B::StridedCuVecOrMat) =
+function syr2k(uplo::Char, trans::Char, A::StridedCuVecOrMat, B::StridedCuVecOrMat)
     syr2k(uplo, trans, one(eltype(A)), A, B)
+end
 
 ## her2k
 for (fname, elty) in ((:cublasZher2k_v2,:ComplexF64),
@@ -1306,19 +1437,16 @@ for (fname, elty) in ((:cublasZher2k_v2,:ComplexF64),
             $fname(handle(), uplo, trans, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
             C
         end
-        function her2k(uplo::Char,
-                       trans::Char,
-                       alpha::Number,
-                       A::StridedCuVecOrMat{$elty},
-                       B::StridedCuVecOrMat{$elty})
-            n = size(A, trans == 'N' ? 1 : 2)
-            her2k!(uplo, trans, alpha, A, B, zero(real($elty)), similar(A, $elty, (n,n)))
-        end
-        her2k(uplo::Char,
-              trans::Char,
-              A::StridedCuVecOrMat{$elty},
-              B::StridedCuVecOrMat{$elty}) = her2k(uplo, trans, one($elty), A, B)
    end
+end
+function her2k(uplo::Char, trans::Char, alpha::Number,
+               A::StridedCuVecOrMat{T}, B::StridedCuVecOrMat{T}) where T
+    n = size(A, trans == 'N' ? 1 : 2)
+    her2k!(uplo, trans, alpha, A, B, zero(real(T)), similar(A, (n,n)))
+end
+function her2k(uplo::Char, trans::Char,
+               A::StridedCuVecOrMat{T}, B::StridedCuVecOrMat{T}) where T
+    her2k(uplo, trans, one(T), A, B)
 end
 
 ## (TR) Triangular matrix and vector multiplication and solution
@@ -1352,15 +1480,7 @@ for (mmname, smname, elty) in
             $mmname(handle(), side, uplo, transa, diag, m, n, alpha, A, lda, B, ldb, C, ldc)
             C
         end
-        function trmm(side::Char,
-                      uplo::Char,
-                      transa::Char,
-                      diag::Char,
-                      alpha::Number,
-                      A::StridedCuMatrix{$elty},
-                      B::StridedCuMatrix{$elty})
-            trmm!(side, uplo, transa, diag, alpha, A, B, similar(B))
-        end
+
         function trsm!(side::Char,
                        uplo::Char,
                        transa::Char,
@@ -1378,16 +1498,15 @@ for (mmname, smname, elty) in
             $smname(handle(), side, uplo, transa, diag, m, n, alpha, A, lda, B, ldb)
             B
         end
-        function trsm(side::Char,
-                      uplo::Char,
-                      transa::Char,
-                      diag::Char,
-                      alpha::Number,
-                      A::StridedCuMatrix{$elty},
-                      B::StridedCuMatrix{$elty})
-            trsm!(side, uplo, transa, diag, alpha, A, copy(B))
-        end
     end
+end
+function trmm(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Number,
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    trmm!(side, uplo, transa, diag, alpha, A, B, similar(B))
+end
+function trsm(side::Char, uplo::Char, transa::Char, diag::Char,alpha::Number,
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    trsm!(side, uplo, transa, diag, alpha, A, copy(B))
 end
 
 ## (TR) triangular triangular matrix solution batched
@@ -1425,16 +1544,11 @@ for (fname, elty) in
 
             B
         end
-        function trsm_batched(side::Char,
-                              uplo::Char,
-                              transa::Char,
-                              diag::Char,
-                              alpha::Number,
-                              A::Vector{<:StridedCuMatrix{$elty}},
-                              B::Vector{<:StridedCuMatrix{$elty}})
-            trsm_batched!(side, uplo, transa, diag, alpha, A, copy(B) )
-        end
     end
+end
+function trsm_batched(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Number,
+                      A::Vector{<:StridedCuMatrix{T}}, B::Vector{<:StridedCuMatrix{T}}) where T
+    trsm_batched!(side, uplo, transa, diag, alpha, A, copy(B) )
 end
 
 # TODO: julia, tr{m,s}m, Char -> Char
@@ -1467,23 +1581,20 @@ for (fname, elty) in ((:cublasDgeam,:Float64),
             $fname(handle(), transa, transb, m, n, alpha, A, lda, beta, B, ldb, C, ldc)
             C
         end
-        function geam(transa::Char,
-                      transb::Char,
-                      alpha::Number,
-                      A::StridedCuMatrix{$elty},
-                      beta::Number,
-                      B::StridedCuMatrix{$elty})
-            m,n = size(B)
-            if ((transb == 'T' || transb == 'C'))
-                geam!( transa, transb, alpha, A, beta, B, similar(B, $elty, (n,m) ) )
-            end
-            if (transb == 'N')
-                geam!( transa, transb, alpha, A, beta, B, similar(B, $elty, (m,n) ) )
-            end
-        end
-        geam( uplo::Char, trans::Char, A::StridedCuMatrix{$elty}, B::StridedCuMatrix{$elty}) =
-            geam( uplo, trans, one($elty), A, one($elty), B)
     end
+end
+function geam(transa::Char, transb::Char, alpha::Number, A::StridedCuMatrix{T},
+              beta::Number, B::StridedCuMatrix{T}) where T
+    m,n = size(B)
+    if transb == 'T' || transb == 'C'
+        geam!(transa, transb, alpha, A, beta, B, similar(B, (n,m) ) )
+    elseif transb == 'N'
+        geam!(transa, transb, alpha, A, beta, B, similar(B, (m,n) ) )
+    end
+end
+function geam(uplo::Char, trans::Char,
+              A::StridedCuMatrix{T}, B::StridedCuMatrix{T}) where T
+    geam(uplo, trans, one(T), A, one(T), B)
 end
 
 ## getrfBatched - performs LU factorizations
@@ -1524,7 +1635,9 @@ function getrf_batched!(A::Vector{<:StridedCuMatrix}, pivot::Bool)
     Aptrs = unsafe_batch(A)
     return getrf_batched!(n, Aptrs, lda, pivot)..., A
 end
-getrf_batched(A::Vector{<:StridedCuMatrix}, pivot::Bool) = getrf_batched!(copy(A), pivot)
+function getrf_batched(A::Vector{<:StridedCuMatrix}, pivot::Bool)
+    getrf_batched!(copy(A), pivot)
+end
 
 # CUDA has no strided batched getrf, but we can at least avoid constructing costly views
 function getrf_strided_batched!(A::DenseCuArray{<:Any, 3}, pivot::Bool)
@@ -1537,7 +1650,9 @@ function getrf_strided_batched!(A::DenseCuArray{<:Any, 3}, pivot::Bool)
     Aptrs = unsafe_strided_batch(A)
     return getrf_batched!(n, Aptrs, lda, pivot)..., A
 end
-getrf_strided_batched(A::DenseCuArray{<:Any, 3}, pivot::Bool) = getrf_strided_batched!(copy(A), pivot)
+function getrf_strided_batched(A::DenseCuArray{<:Any, 3}, pivot::Bool)
+    getrf_strided_batched!(copy(A), pivot)
+end
 
 
 ## getriBatched - performs batched matrix inversion
@@ -1693,10 +1808,10 @@ for (fname, elty) in
 
             TauArray, A
         end
-        function geqrf_batched(A::Vector{<:CuMatrix{$elty}})
-            geqrf_batched!(copy(A))
-        end
     end
+end
+function geqrf_batched(A::Vector{<:CuMatrix})
+    geqrf_batched!(copy(A))
 end
 
 ## gelsBatched - performs batched least squares
@@ -1746,12 +1861,10 @@ for (fname, elty) in
 
             A, C, infoarray
         end
-        function gels_batched(trans::Char,
-                             A::Vector{<:CuMatrix{$elty}},
-                             C::Vector{<:CuMatrix{$elty}})
-            gels_batched!(trans, deepcopy(A), deepcopy(C))
-        end
     end
+end
+function gels_batched(trans::Char, A::Vector{<:CuMatrix{T}}, C::Vector{<:CuMatrix{T}}) where T
+    gels_batched!(trans, deepcopy(A), deepcopy(C))
 end
 
 ## dgmm
@@ -1776,13 +1889,11 @@ for (fname, elty) in ((:cublasDdgmm,:Float64),
             $fname(handle(), mode, m, n, A, lda, X, incx, C, ldc)
             C
         end
-        function dgmm(mode::Char,
-                      A::StridedCuMatrix{$elty},
-                      X::StridedCuVector{$elty})
-            m,n = size(A)
-            dgmm!( mode, A, X, similar(A, $elty, (m,n) ) )
-        end
     end
+end
+function dgmm(mode::Char, A::StridedCuMatrix{T}, X::StridedCuVector{T}) where T
+    m,n = size(A)
+    dgmm!( mode, A, X, similar(A, (m,n) ) )
 end
 
 # cublasXT
@@ -1821,22 +1932,22 @@ for (fname, elty) in
             $fname(xt_handle(), transA, transB, m, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
             C
         end
-        function xt_gemm(transA::Char,
-                      transB::Char,
-                      alpha::Number,
-                      A::Union{StridedCuVecOrMat{$elty}, StridedVecOrMat{$elty}},
-                      B::Union{StridedCuVecOrMat{$elty}, StridedVecOrMat{$elty}})
-            xt_gemm!(transA, transB, alpha, A, B, zero($elty),
-                  similar(B, $elty, (size(A, transA == 'N' ? 1 : 2),
-                                     size(B, transB == 'N' ? 2 : 1))))
-        end
-        function xt_gemm(transA::Char,
-                      transB::Char,
-                      A::Union{StridedCuVecOrMat{$elty}, StridedVecOrMat{$elty}},
-                      B::Union{StridedCuVecOrMat{$elty}, StridedVecOrMat{$elty}})
-            xt_gemm(transA, transB, one($elty), A, B)
-        end
     end
+end
+function xt_gemm(transA::Char,
+                 transB::Char,
+                 alpha::Number,
+                 A::Union{StridedCuVecOrMat{T}, StridedVecOrMat{T}},
+                 B::Union{StridedCuVecOrMat{T}, StridedVecOrMat{T}}) where T
+    xt_gemm!(transA, transB, alpha, A, B, zero(T),
+            similar(B, (size(A, transA == 'N' ? 1 : 2),
+                        size(B, transB == 'N' ? 2 : 1))))
+end
+function xt_gemm(transA::Char,
+                 transB::Char,
+                 A::Union{StridedCuVecOrMat{T}, StridedVecOrMat{T}},
+                 B::Union{StridedCuVecOrMat{T}, StridedVecOrMat{T}}) where T
+    xt_gemm(transA, transB, one(T), A, B)
 end
 
 for (fname, elty) in ((:cublasXtZhemm,:ComplexF64),
@@ -1862,20 +1973,20 @@ for (fname, elty) in ((:cublasXtZhemm,:ComplexF64),
             $fname(xt_handle(), side, uplo, m, n, alpha, A, lda, B, ldb, beta, C, ldc)
             C
         end
-        function xt_hemm(uplo::Char,
-                      trans::Char,
-                      alpha::Number,
-                      A::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}},
-                      B::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}})
-            m,n = size(B)
-            xt_hemm!( uplo, trans, alpha, A, B, zero($elty), similar(B, $elty, (m,n) ) )
-        end
-        xt_hemm(uplo::Char, trans::Char,
-                A::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}},
-                B::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}}) =
-            xt_hemm( uplo, trans, one($elty), A, B)
     end
 end
+function xt_hemm(uplo::Char,
+                 trans::Char,
+                 alpha::Number,
+                 A::Union{StridedMatrix{T}, StridedCuMatrix{T}},
+                 B::Union{StridedMatrix{T}, StridedCuMatrix{T}}) where T
+    m,n = size(B)
+    xt_hemm!(uplo, trans, alpha, A, B, zero(T), similar(B, (m,n) ))
+end
+xt_hemm(uplo::Char, trans::Char,
+        A::Union{StridedMatrix{T}, StridedCuMatrix{T}},
+        B::Union{StridedMatrix{T}, StridedCuMatrix{T}}) where T =
+    xt_hemm(uplo, trans, one(T), A, B)
 
 for (fname, elty) in ((:cublasXtDsymm,:Float64),
                       (:cublasXtSsymm,:Float32),
@@ -1904,20 +2015,17 @@ for (fname, elty) in ((:cublasXtDsymm,:Float64),
                    beta, C, ldc)
             C
         end
-        function xt_symm(side::Char,
-                      uplo::Char,
-                      alpha::Number,
-                      A::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}},
-                      B::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}})
-            xt_symm!(side, uplo, alpha, A, B, zero($elty), similar(B))
-        end
-        function xt_symm(side::Char,
-                      uplo::Char,
-                      A::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}},
-                      B::Union{StridedMatrix{$elty}, StridedCuMatrix{$elty}})
-            xt_symm(side, uplo, one($elty), A, B)
-        end
     end
+end
+function xt_symm(side::Char, uplo::Char, alpha::Number,
+                 A::Union{StridedMatrix{T}, StridedCuMatrix{T}},
+                 B::Union{StridedMatrix{T}, StridedCuMatrix{T}}) where T
+    xt_symm!(side, uplo, alpha, A, B, zero(T), similar(B))
+end
+function xt_symm(side::Char, uplo::Char,
+                 A::Union{StridedMatrix{T}, StridedCuMatrix{T}},
+                 B::Union{StridedMatrix{T}, StridedCuMatrix{T}}) where T
+    xt_symm(side, uplo, one(T), A, B)
 end
 
 for (fname, elty) in ((:cublasXtDsyrk,:Float64),
@@ -1943,10 +2051,8 @@ for (fname, elty) in ((:cublasXtDsyrk,:Float64),
         end
     end
 end
-function xt_syrk(uplo::Char,
-              trans::Char,
-              alpha::Number,
-              A::Union{StridedVecOrMat, StridedCuVecOrMat})
+function xt_syrk(uplo::Char, trans::Char, alpha::Number,
+                 A::Union{StridedVecOrMat, StridedCuVecOrMat})
     T = eltype(A)
     n = size(A, trans == 'N' ? 1 : 2)
     xt_syrk!(uplo, trans, alpha, A, zero(T), similar(A, T, (n, n)))
@@ -1979,9 +2085,7 @@ for (fname, elty) in ((:cublasXtDsyrkx,:Float64),
         end
     end
 end
-function xt_syrkx(uplo::Char,
-              trans::Char,
-              alpha::Number,
+function xt_syrkx(uplo::Char, trans::Char, alpha::Number,
               A::Union{StridedVecOrMat, StridedCuVecOrMat},
               B::Union{StridedVecOrMat, StridedCuVecOrMat},
               beta::Number)
@@ -2013,15 +2117,16 @@ for (fname, elty) in ((:cublasXtZherk,:ComplexF64),
             $fname(xt_handle(), uplo, trans, n, k, alpha, A, lda, beta, C, ldc)
             C
         end
-        function xt_herk(uplo::Char, trans::Char, alpha::Real,
-                         A::Union{StridedVecOrMat{$elty}, StridedCuVecOrMat{$elty}})
-            n = size(A, trans == 'N' ? 1 : 2)
-            xt_herk!(uplo, trans, alpha, A, real(zero($elty)), similar(A, $elty, (n,n)))
-        end
-        xt_herk(uplo::Char, trans::Char,
-                A::Union{StridedVecOrMat{$elty}, StridedCuVecOrMat{$elty}}) =
-            xt_herk(uplo, trans, real(one($elty)), A)
    end
+end
+function xt_herk(uplo::Char, trans::Char, alpha::Real,
+                 A::Union{StridedVecOrMat{T}, StridedCuVecOrMat{T}}) where T
+    n = size(A, trans == 'N' ? 1 : 2)
+    xt_herk!(uplo, trans, alpha, A, real(zero(T)), similar(A, T, (n,n)))
+end
+function xt_herk(uplo::Char, trans::Char,
+                 A::Union{StridedVecOrMat{T}, StridedCuVecOrMat{T}}) where T
+    xt_herk(uplo, trans, real(one(T)), A)
 end
 
 for (fname, elty) in ((:cublasXtZher2k,:ComplexF64),
@@ -2051,19 +2156,19 @@ for (fname, elty) in ((:cublasXtZher2k,:ComplexF64),
             $fname(xt_handle(), uplo, trans, n, k, alpha, A, lda, B, ldb, beta, C, ldc)
             C
         end
-        function xt_her2k(uplo::Char,
-                       trans::Char,
-                       alpha::Number,
-                       A::Union{StridedVecOrMat{$elty}, StridedCuVecOrMat{$elty}},
-                       B::Union{StridedVecOrMat{$elty}, StridedCuVecOrMat{$elty}})
-            n = size(A, trans == 'N' ? 1 : 2)
-            xt_her2k!(uplo, trans, alpha, A, B, zero(real($elty)), similar(A, $elty, (n,n)))
-        end
-        xt_her2k(uplo::Char, trans::Char,
-                 A::Union{StridedVecOrMat{$elty}, StridedCuVecOrMat{$elty}},
-                 B::Union{StridedVecOrMat{$elty}, StridedCuVecOrMat{$elty}}) =
-            xt_her2k(uplo, trans, one($elty), A, B)
     end
+end
+
+function xt_her2k(uplo::Char, trans::Char, alpha::Number,
+                  A::Union{StridedVecOrMat{T}, StridedCuVecOrMat{T}},
+                  B::Union{StridedVecOrMat{T}, StridedCuVecOrMat{T}}) where T
+    n = size(A, trans == 'N' ? 1 : 2)
+    xt_her2k!(uplo, trans, alpha, A, B, zero(real(T)), similar(A, (n,n)))
+end
+function xt_her2k(uplo::Char, trans::Char,
+                  A::Union{StridedVecOrMat{T}, StridedCuVecOrMat{T}},
+                  B::Union{StridedVecOrMat{T}, StridedCuVecOrMat{T}}) where T
+    xt_her2k(uplo, trans, one(T), A, B)
 end
 
 for (mmname, smname, elty) in
@@ -2096,15 +2201,6 @@ for (mmname, smname, elty) in
             $mmname(xt_handle(), side, uplo, transa, diag, m, n, alpha, A, lda, B, ldb, C, ldc)
             C
         end
-        function xt_trmm(side::Char,
-                      uplo::Char,
-                      transa::Char,
-                      diag::Char,
-                      alpha::Number,
-                      A::Union{StridedCuMatrix{$elty}, StridedMatrix{$elty}},
-                      B::Union{StridedCuMatrix{$elty}, StridedMatrix{$elty}})
-            xt_trmm!(side, uplo, transa, diag, alpha, A, B, similar(B))
-        end
         function xt_trsm!(side::Char,
                        uplo::Char,
                        transa::Char,
@@ -2122,15 +2218,16 @@ for (mmname, smname, elty) in
             $smname(xt_handle(), side, uplo, transa, diag, m, n, alpha, A, lda, B, ldb)
             B
         end
-        function xt_trsm(side::Char,
-                      uplo::Char,
-                      transa::Char,
-                      diag::Char,
-                      alpha::Number,
-                      A::Union{StridedCuMatrix{$elty}, StridedMatrix{$elty}},
-                      B::Union{StridedCuMatrix{$elty}, StridedMatrix{$elty}})
-            # TODO: better way to perform synchronous copy
-            xt_trsm!(side, uplo, transa, diag, alpha, A, @sync(copy(B)))
-        end
     end
+end
+function xt_trmm(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Number,
+                 A::Union{StridedCuMatrix{T}, StridedMatrix{T}},
+                 B::Union{StridedCuMatrix{T}, StridedMatrix{T}}) where T
+    xt_trmm!(side, uplo, transa, diag, alpha, A, B, similar(B))
+end
+function xt_trsm(side::Char, uplo::Char, transa::Char, diag::Char, alpha::Number,
+                 A::Union{StridedCuMatrix{T}, StridedMatrix{T}},
+                 B::Union{StridedCuMatrix{T}, StridedMatrix{T}}) where T
+    # TODO: better way to perform synchronous copy
+    xt_trsm!(side, uplo, transa, diag, alpha, A, @sync(copy(B)))
 end
